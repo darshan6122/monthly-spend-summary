@@ -8,6 +8,8 @@
 import Combine
 import Foundation
 import AppKit
+import UniformTypeIdentifiers
+import UserNotifications
 
 final class AccountsHelper: ObservableObject {
     @Published var monthFolders: [String] = []
@@ -22,8 +24,18 @@ final class AccountsHelper: ObservableObject {
     @Published var accountsFolderPath: String = ""
     /// Callback to retry last failed action (merge/report).
     var lastFailedAction: (() -> Void)?
+    /// When the last merge/report completed successfully (for display in Advanced).
+    @Published var lastRunDate: Date?
+    /// Short "what to do" when a script or setup fails (e.g. "Install Python: brew install python3").
+    @Published var errorRecoveryHint: String = ""
+    /// Path to the last successfully generated report (for "Open last report").
+    @Published var lastReportPath: URL?
 
     private var accountsDirURL: URL?
+
+    private static let recentFoldersKey = "ExpenseReports.recentFolders"
+    private static let pinnedFolderKey = "ExpenseReports.pinnedFolder"
+    private static let maxRecentCount = 5
 
     /// Fixed folder: ~/Library/Application Support/ExpenseReports/Accounts
     private static func appAccountsDirectory() -> URL {
@@ -119,6 +131,7 @@ final class AccountsHelper: ObservableObject {
     func refreshFolders() {
         guard let dir = accountsDirURL else { return }
         loadMonthFolders(from: dir)
+        updateSetupInstructions(dir: dir)
     }
 
     private func loadMonthFolders(from accountsDir: URL) {
@@ -140,12 +153,43 @@ final class AccountsHelper: ObservableObject {
             }
         }
         monthFolders = folders.sorted()
-        if let first = monthFolders.first {
-            selectedFolder = first
-            statusMessage = ""
-        } else {
-            selectedFolder = ""
+        if selectedFolder.isEmpty || !monthFolders.contains(selectedFolder) {
+            if let pinned = UserDefaults.standard.string(forKey: Self.pinnedFolderKey), monthFolders.contains(pinned) {
+                selectedFolder = pinned
+            } else if let first = monthFolders.first {
+                selectedFolder = first
+            } else {
+                selectedFolder = ""
+            }
+        }
+        if !selectedFolder.isEmpty { addToRecent(selectedFolder) }
+        if monthFolders.isEmpty {
             statusMessage = "Put month folders (with cibc*.csv) here, plus .venv and the Python scripts."
+        } else {
+            statusMessage = ""
+        }
+    }
+
+    private func addToRecent(_ name: String) {
+        var recent = UserDefaults.standard.stringArray(forKey: Self.recentFoldersKey) ?? []
+        recent.removeAll { $0 == name }
+        recent.insert(name, at: 0)
+        recent = Array(recent.prefix(Self.maxRecentCount))
+        UserDefaults.standard.set(recent, forKey: Self.recentFoldersKey)
+    }
+
+    func recentFolderNames() -> [String] {
+        (UserDefaults.standard.stringArray(forKey: Self.recentFoldersKey) ?? []).filter { monthFolders.contains($0) }
+    }
+
+    var pinnedFolder: String? {
+        get {
+            guard let p = UserDefaults.standard.string(forKey: Self.pinnedFolderKey), monthFolders.contains(p) else { return nil }
+            return p
+        }
+        set {
+            if let n = newValue { UserDefaults.standard.set(n, forKey: Self.pinnedFolderKey) }
+            else { UserDefaults.standard.removeObject(forKey: Self.pinnedFolderKey) }
         }
     }
     
@@ -211,11 +255,18 @@ final class AccountsHelper: ObservableObject {
         guard let base = accountsDirURL else { return (false, "ACCOUNTS folder not found.") }
         let scriptURL = base.appendingPathComponent(name)
         guard FileManager.default.fileExists(atPath: scriptURL.path) else {
+            DispatchQueue.main.async { [weak self] in
+                self?.errorRecoveryHint = "Copy make_monthly_report.py and merge_and_categorize.py from your Desktop ACCOUNTS folder into the data folder (Open Data Folder → paste files)."
+            }
             return (false, "Put make_monthly_report.py and merge_and_categorize.py in the accounts folder.")
         }
         guard let (pythonPath, venvPath) = findWorkingPython(base: base) else {
+            DispatchQueue.main.async { [weak self] in
+                self?.errorRecoveryHint = "Install Python: brew install python3 — or add a .venv with Python to your data folder (Copy from Desktop if you have one)."
+            }
             return (false, "No Python found. Install from python.org or run: brew install python3")
         }
+        DispatchQueue.main.async { [weak self] in self?.errorRecoveryHint = "" }
         // Run via /bin/sh so we never exec Python directly (avoids "python3.13 doesn't exist" dialog).
         var exports = "export EXPENSE_REPORTS_ACCOUNTS_DIR='\(shellEscape(base.path))'; "
         if let venv = venvPath {
@@ -280,15 +331,21 @@ final class AccountsHelper: ObservableObject {
                 self.stepMessage = ""
                 if reportResult.success {
                     self.lastFailedAction = nil
+                    self.lastRunDate = Date()
                     self.statusMessage = "✓ Report saved in \(folderName) folder."
-                    self.openMonthFolderInFinder()
+                    let reportURL = self.accountsDirURL?.appendingPathComponent(self.selectedFolder).appendingPathComponent("\(folderName)_Report.xlsx")
+                    if let url = reportURL, FileManager.default.fileExists(atPath: url.path) {
+                        self.lastReportPath = url
+                        Self.sendReportReadyNotification(month: folderName)
+                    }
+                    if AppSettings.openFolderAfterReport { self.openMonthFolderInFinder() }
                 } else {
                     self.statusMessage = "✗ \(reportResult.message)"
                 }
             }
         }
     }
-    
+
     func generateReport() {
         guard !selectedFolder.isEmpty else {
             statusMessage = "Select a month folder first."
@@ -306,8 +363,16 @@ final class AccountsHelper: ObservableObject {
                 self?.stepMessage = ""
                 if result.success {
                     self?.lastFailedAction = nil
+                    self?.lastRunDate = Date()
                     self?.statusMessage = "✓ Report saved in \(folderName) folder."
-                    self?.openMonthFolderInFinder()
+                    if let base = self?.accountsDirURL {
+                        let reportURL = base.appendingPathComponent(folderName).appendingPathComponent("\(folderName)_Report.xlsx")
+                        if FileManager.default.fileExists(atPath: reportURL.path) {
+                            self?.lastReportPath = reportURL
+                            Self.sendReportReadyNotification(month: folderName)
+                        }
+                    }
+                    if AppSettings.openFolderAfterReport { self?.openMonthFolderInFinder() }
                 } else {
                     self?.statusMessage = "✗ \(result.message)"
                 }
@@ -330,7 +395,10 @@ final class AccountsHelper: ObservableObject {
                 self?.isWorking = false
                 self?.stepMessage = ""
                 self?.statusMessage = result.success ? "✓ \(result.message)" : "✗ \(result.message)"
-                if result.success { self?.lastFailedAction = nil }
+                if result.success {
+                    self?.lastFailedAction = nil
+                    self?.lastRunDate = Date()
+                }
             }
         }
     }
@@ -374,5 +442,240 @@ final class AccountsHelper: ObservableObject {
         let reportURL = base.appendingPathComponent(selectedFolder).appendingPathComponent("\(selectedFolder)_Report.xlsx")
         guard FileManager.default.fileExists(atPath: reportURL.path) else { return }
         NSWorkspace.shared.open(reportURL)
+    }
+
+    /// Open the last successfully generated report (from menu or UI).
+    func openLastReport() {
+        guard let url = lastReportPath, FileManager.default.fileExists(atPath: url.path) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// Copy the current (or last) report file path to the pasteboard. Returns true if copied.
+    func copyReportPathToClipboard() -> Bool {
+        let url: URL?
+        if let last = lastReportPath, FileManager.default.fileExists(atPath: last.path) {
+            url = last
+        } else if let base = accountsDirURL, !selectedFolder.isEmpty {
+            url = base.appendingPathComponent(selectedFolder).appendingPathComponent("\(selectedFolder)_Report.xlsx")
+            if !FileManager.default.fileExists(atPath: url!.path) { return false }
+        } else {
+            return false
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url!.path, forType: .string)
+        return true
+    }
+
+    private static let hasRequestedNotificationKey = "ExpenseReports.hasRequestedNotification"
+
+    private static func sendReportReadyNotification(month: String) {
+        if !UserDefaults.standard.bool(forKey: hasRequestedNotificationKey) {
+            UserDefaults.standard.set(true, forKey: hasRequestedNotificationKey)
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
+        let content = UNMutableNotificationContent()
+        content.title = "Report ready"
+        content.body = "\(month)_Report.xlsx has been created."
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: "report-\(UUID().uuidString)", content: content, trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.5, repeats: false))
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Create a new month folder (e.g. "FEBRUARY 2026") in the data folder. Returns (success, message).
+    func createNewMonthFolder() -> (success: Bool, message: String) {
+        guard let base = accountsDirURL else { return (false, "Data folder not found.") }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMMM yyyy"
+        formatter.locale = Locale(identifier: "en_US")
+        let name = formatter.string(from: Date()).uppercased()
+        let folderURL = base.appendingPathComponent(name, isDirectory: true)
+        let fm = FileManager.default
+        if fm.fileExists(atPath: folderURL.path) {
+            return (false, "Folder \"\(name)\" already exists.")
+        }
+        do {
+            try fm.createDirectory(at: folderURL, withIntermediateDirectories: true)
+            addToRecent(name)
+            loadMonthFolders(from: base)
+            selectedFolder = name
+            return (true, "Created \"\(name)\". Add your CIBC CSV files and refresh.")
+        } catch {
+            return (false, error.localizedDescription)
+        }
+    }
+
+    /// Present Save panel to export the selected month as a zip.
+    func exportMonthBackupWithSavePanel() {
+        guard !selectedFolder.isEmpty else {
+            statusMessage = "✗ Select a month first."
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "Export month as zip"
+        panel.nameFieldStringValue = "\(selectedFolder).zip"
+        panel.allowedContentTypes = [.zip]
+        panel.begin { [weak self] response in
+            guard let self = self, response == .OK, let url = panel.url else { return }
+            let r = self.exportMonthBackup(to: url)
+            self.statusMessage = r.success ? "✓ \(r.message)" : "✗ \(r.message)"
+        }
+    }
+
+    /// Export only the selected month folder as a zip to the given URL.
+    func exportMonthBackup(to destinationURL: URL) -> (success: Bool, message: String) {
+        guard let base = accountsDirURL, !selectedFolder.isEmpty else { return (false, "Select a month first.") }
+        let monthURL = base.appendingPathComponent(selectedFolder, isDirectory: true)
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: monthURL.path) else { return (false, "Month folder not found.") }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", monthURL.path, destinationURL.path]
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0 {
+                return (true, "Exported \(selectedFolder) to \(destinationURL.lastPathComponent)")
+            }
+            return (false, "Export failed.")
+        } catch {
+            return (false, error.localizedDescription)
+        }
+    }
+
+    /// Present Save panel to export the current report; on OK copies to chosen URL and updates status.
+    func exportReportWithSavePanel() {
+        guard let base = accountsDirURL, !selectedFolder.isEmpty else {
+            statusMessage = "✗ Select a month and create a report first."
+            return
+        }
+        let reportName = "\(selectedFolder)_Report.xlsx"
+        let sourceURL = base.appendingPathComponent(selectedFolder).appendingPathComponent(reportName)
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+            statusMessage = "✗ Report not found. Create a report first."
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "Export Report"
+        panel.nameFieldStringValue = reportName
+        panel.allowedContentTypes = [UTType(filenameExtension: "xlsx") ?? .data]
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            let r = self.exportReport(to: url)
+            self.statusMessage = r.success ? "✓ \(r.message)" : "✗ \(r.message)"
+        }
+    }
+
+    /// Copy the current month's report to a chosen URL (e.g. from Save panel). Returns (success, message).
+    func exportReport(to destinationURL: URL) -> (success: Bool, message: String) {
+        guard let base = accountsDirURL, !selectedFolder.isEmpty else { return (false, "No month selected.") }
+        let reportName = "\(selectedFolder)_Report.xlsx"
+        let sourceURL = base.appendingPathComponent(selectedFolder).appendingPathComponent(reportName)
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: sourceURL.path) else { return (false, "Report not found. Create a report first.") }
+        do {
+            if fm.fileExists(atPath: destinationURL.path) { try fm.removeItem(at: destinationURL) }
+            try fm.copyItem(at: sourceURL, to: destinationURL)
+            return (true, "Saved to \(destinationURL.lastPathComponent)")
+        } catch {
+            return (false, error.localizedDescription)
+        }
+    }
+
+    /// Copy the current month's report to the user's Desktop. Returns (success, message).
+    func exportReportToDesktop() -> (success: Bool, message: String) {
+        guard !selectedFolder.isEmpty else { return (false, "Select a month first.") }
+        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first!
+        let name = "\(selectedFolder)_Report.xlsx"
+        let dest = desktop.appendingPathComponent(name)
+        return exportReport(to: dest)
+    }
+
+    /// Present Save panel for backup zip; on OK creates zip and updates status.
+    func exportBackupWithSavePanel() {
+        let panel = NSSavePanel()
+        panel.title = "Export Backup"
+        panel.nameFieldStringValue = "ExpenseReports-Backup-\(ISO8601DateFormatter().string(from: Date()).prefix(10)).zip"
+        panel.allowedContentTypes = [.zip]
+        panel.canCreateDirectories = true
+        panel.begin { [weak self] response in
+            guard let self = self, response == .OK, let url = panel.url else { return }
+            let r = self.exportBackup(to: url)
+            self.statusMessage = r.success ? "✓ \(r.message)" : "✗ \(r.message)"
+        }
+    }
+
+    /// Present Open panel to choose a backup zip; on OK restores and updates status.
+    func restoreBackupWithOpenPanel() {
+        let panel = NSOpenPanel()
+        panel.title = "Restore from Backup"
+        panel.allowedContentTypes = [.zip]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.begin { [weak self] response in
+            guard let self = self, response == .OK, let url = panel.url else { return }
+            let r = self.restoreBackup(from: url)
+            self.statusMessage = r.success ? "✓ \(r.message)" : "✗ \(r.message)"
+        }
+    }
+
+    /// Create a zip of the entire Accounts folder and save to the given URL. Returns (success, message).
+    func exportBackup(to destinationURL: URL) -> (success: Bool, message: String) {
+        guard let base = accountsDirURL else { return (false, "Data folder not found.") }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", base.path, destinationURL.path]
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0 {
+                return (true, "Backup saved to \(destinationURL.lastPathComponent)")
+            }
+            return (false, "Backup failed (exit \(process.terminationStatus)).")
+        } catch {
+            return (false, error.localizedDescription)
+        }
+    }
+
+    /// Restore from a backup zip: expand into a temp dir, then replace Accounts contents (or merge). Returns (success, message).
+    func restoreBackup(from sourceURL: URL) -> (success: Bool, message: String) {
+        guard let base = accountsDirURL else { return (false, "Data folder not found.") }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: sourceURL.path) else { return (false, "Backup file not found.") }
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        do {
+            try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+            process.arguments = ["-o", "-q", sourceURL.path, "-d", tempDir.path]
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                try? fm.removeItem(at: tempDir)
+                return (false, "Could not read backup file.")
+            }
+            // unzip often creates one top-level folder; find the first folder that looks like our data
+            let contents = try fm.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: [.isDirectoryKey], options: [])
+            let sourceRoot: URL
+            if let single = contents.first, contents.count == 1,
+               (try? single.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                sourceRoot = single
+            } else {
+                sourceRoot = tempDir
+            }
+            // Copy contents into Accounts (overwrite)
+            for item in try fm.contentsOfDirectory(at: sourceRoot, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+                let dest = base.appendingPathComponent(item.lastPathComponent)
+                if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+                try fm.copyItem(at: item, to: dest)
+            }
+            try fm.removeItem(at: tempDir)
+            refreshFolders()
+            return (true, "Backup restored. Refreshed folder list.")
+        } catch {
+            try? fm.removeItem(at: tempDir)
+            return (false, error.localizedDescription)
+        }
     }
 }

@@ -11,10 +11,15 @@ import SwiftUI
 struct ExpenseReportsApp: App {
     @StateObject private var helper = AccountsHelper()
     @State private var showUninstallAlert = false
+    @State private var showAbout = false
+    @State private var showSettings = false
+
+    private static let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+    private static let releasesURL = URL(string: "https://github.com/darshan6122/monthly-spend-summary/releases")!
 
     var body: some Scene {
         WindowGroup("Monthly Reports") {
-            ContentView()
+            ContentView(showSettings: $showSettings)
                 .environmentObject(helper)
                 .alert("Uninstall ExpenseReports?", isPresented: $showUninstallAlert) {
                     Button("Cancel", role: .cancel) {}
@@ -24,11 +29,37 @@ struct ExpenseReportsApp: App {
                 } message: {
                     Text("This will remove ExpenseReports and all its data. The app will quit.")
                 }
+                .onOpenURL { url in
+                    handleURL(url)
+                }
+                .sheet(isPresented: $showAbout) {
+                    AboutView(version: Self.appVersion)
+                }
         }
         .windowStyle(.automatic)
         .defaultSize(width: 540, height: 480)
         .commands {
             CommandGroup(after: .appInfo) {
+                Button("About Monthly Reports…") {
+                    showAbout = true
+                }
+                Button("Open Data Folder", systemImage: "folder") {
+                    helper.openAccountsFolderInFinder()
+                }
+                .keyboardShortcut("o", modifiers: .command)
+                Button("Open Last Report", systemImage: "doc.fill") {
+                    helper.openLastReport()
+                }
+                .disabled(helper.lastReportPath == nil)
+                .keyboardShortcut("l", modifiers: [.command, .shift])
+                Button("Settings…", systemImage: "gearshape") {
+                    showSettings = true
+                }
+                .keyboardShortcut(",", modifiers: .command)
+                Button("Check for Updates…") {
+                    NSWorkspace.shared.open(Self.releasesURL)
+                }
+                Divider()
                 Button("Uninstall ExpenseReports…") {
                     showUninstallAlert = true
                 }
@@ -37,6 +68,7 @@ struct ExpenseReportsApp: App {
                 Button("Merge & create report") {
                     helper.mergeThenGenerate()
                 }
+                .keyboardShortcut("1", modifiers: .command)
                 .disabled(helper.isWorking || helper.selectedFolder.isEmpty)
 
                 Button("Create report only") {
@@ -59,5 +91,41 @@ struct ExpenseReportsApp: App {
                 }
             }
         }
+    }
+
+    private func handleURL(_ url: URL) {
+        guard url.scheme == "monthlyreports" else { return }
+        if url.host == "run", let month = url.path.split(separator: "/").last.map(String.init), !month.isEmpty {
+            if helper.monthFolders.contains(month) {
+                helper.selectedFolder = month
+                helper.mergeThenGenerate()
+            }
+        }
+    }
+}
+
+// MARK: - About
+struct AboutView: View {
+    let version: String
+    @Environment(\.dismiss) private var dismiss
+    private let releasesURL = URL(string: "https://github.com/darshan6122/monthly-spend-summary/releases")!
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Monthly Reports")
+                .font(.title.bold())
+            Text("CIBC Export Processor")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Text("Version \(version)")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+            Link("View releases on GitHub", destination: releasesURL)
+                .font(.caption)
+            Button("OK") { dismiss() }
+                .keyboardShortcut(.defaultAction)
+        }
+        .padding(40)
+        .frame(minWidth: 280)
     }
 }

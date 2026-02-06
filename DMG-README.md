@@ -46,3 +46,7 @@ Pass a version as the first argument to change the DMG filename:
   `--volicon "/path/to/AppIcon.icns" \`
 
 Then run `./create-dmg.sh` again.
+
+## Code signing and notarization
+
+To avoid "unidentified developer" warnings on other Macs, sign and notarize the app or DMG with an Apple Developer account. See **[NOTARIZE.md](NOTARIZE.md)** for step-by-step instructions.

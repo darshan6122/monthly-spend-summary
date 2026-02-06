@@ -37,6 +37,14 @@ echo "Preparing DMG contents..."
 rm -rf "$DMG_SOURCE"
 mkdir -p "$DMG_SOURCE"
 cp -R "$APP_PATH" "$DMG_SOURCE/"
+# Include uninstaller and instructions in the DMG
+if [[ -f "$PROJECT_DIR/Uninstall ExpenseReports.command" ]]; then
+    cp "$PROJECT_DIR/Uninstall ExpenseReports.command" "$DMG_SOURCE/"
+    chmod +x "$DMG_SOURCE/Uninstall ExpenseReports.command"
+fi
+if [[ -f "$PROJECT_DIR/Uninstall-Instructions.txt" ]]; then
+    cp "$PROJECT_DIR/Uninstall-Instructions.txt" "$DMG_SOURCE/"
+fi
 
 # Remove previous DMG if present
 rm -f "$OUTPUT_DMG"
@@ -45,7 +53,7 @@ echo "Creating DMG..."
 create-dmg \
     --volname "Install $APP_NAME" \
     --window-pos 200 120 \
-    --window-size 600 400 \
+    --window-size 640 420 \
     --icon-size 100 \
     --icon "${APP_NAME}.app" 150 190 \
     --hide-extension "${APP_NAME}.app" \

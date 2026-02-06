@@ -38,3 +38,5 @@ Thumbs.db
 # IDE / editors
 .idea/
 *.bak
+.DS_Store
+*.csv # Only do this if you want to keep the data files private

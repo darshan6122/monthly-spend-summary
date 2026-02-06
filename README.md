@@ -53,6 +53,14 @@ To build a **drag-and-drop DMG** for distribution:
 The app displays as **Monthly Reports** and uses the data folder:  
 `~/Library/Application Support/ExpenseReports/Accounts`
 
+### URL scheme (Shortcuts / automation)
+
+You can trigger a report from Shortcuts or the command line using the custom URL scheme:
+
+- **monthlyreports://run/December%202025** — Opens the app, selects that month (if it exists), and runs **Merge & Create Report**.
+
+Example in Terminal: `open "monthlyreports://run/December%202025"`
+
 ## License
 
 **All rights reserved.** This project is not licensed for public use. You may not use, copy, modify, or distribute this code without permission from the owner. See [LICENSE](LICENSE) for details.
