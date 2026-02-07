@@ -1,0 +1,6 @@
+# Copy these into your app data folder's .venv (or use for reference).
+# Required for Excel report:
+openpyxl>=3.0.0
+
+# Optional: for Smart Category (TF-IDF + Random Forest). If not installed, merge uses keyword + custom_mapping only.
+scikit-learn>=1.0.0

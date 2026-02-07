@@ -47,11 +47,17 @@ struct ExpenseReportsApp: App {
                     helper.openAccountsFolderInFinder()
                 }
                 .keyboardShortcut("o", modifiers: .command)
-                Button("Open Last Report", systemImage: "doc.fill") {
-                    helper.openLastReport()
+                Button("View report summary", systemImage: "chart.bar.doc.horizontal") {
+                    helper.requestShowReportSummary = true
+                }
+                .disabled(helper.selectedFolder.isEmpty)
+                .keyboardShortcut("l", modifiers: [.command, .shift])
+                Button("Open last report (Numbers/Excel)", systemImage: "doc.fill") {
+                    if !helper.openLastReport() {
+                        helper.requestShowReportSummary = true
+                    }
                 }
                 .disabled(helper.lastReportPath == nil)
-                .keyboardShortcut("l", modifiers: [.command, .shift])
                 Button("Settings…", systemImage: "gearshape") {
                     showSettings = true
                 }

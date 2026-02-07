@@ -5,6 +5,28 @@
 
 import SwiftUI
 
+/// Canonical list of expense categories (training, reports, Quick Stats). Keep in sync with Scripts/merge_and_categorize.py.
+enum CategoryTypes {
+    static let all: [String] = [
+        "Food & Dining",
+        "Groceries",
+        "Transport",
+        "Shopping",
+        "Bills & Utilities",
+        "Transfer to Savings",
+        "Bank Transfers",
+        "Entertainment",
+        "Health & Pharmacy",
+        "Subscriptions",
+        "Travel",
+        "Gifts & Donations",
+        "Other",
+        "Uncategorized"
+    ]
+
+    static let defaultCategory = "Uncategorized"
+}
+
 /// User preferences (persisted in UserDefaults).
 enum AppSettings {
     private static let openFolderAfterReportKey = "ExpenseReports.openFolderAfterReport"

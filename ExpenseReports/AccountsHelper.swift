@@ -30,6 +30,8 @@ final class AccountsHelper: ObservableObject {
     @Published var errorRecoveryHint: String = ""
     /// Path to the last successfully generated report (for "Open last report").
     @Published var lastReportPath: URL?
+    /// When set to true, the UI should present the in-app report summary sheet (no Excel needed).
+    @Published var requestShowReportSummary: Bool = false
 
     private var accountsDirURL: URL?
 
@@ -436,18 +438,39 @@ final class AccountsHelper: ObservableObject {
         return (csvCount, reportDate)
     }
 
-    /// Open the selected month's report .xlsx in the default app.
-    func openReportFile() {
-        guard let base = accountsDirURL, !selectedFolder.isEmpty else { return }
-        let reportURL = base.appendingPathComponent(selectedFolder).appendingPathComponent("\(selectedFolder)_Report.xlsx")
-        guard FileManager.default.fileExists(atPath: reportURL.path) else { return }
-        NSWorkspace.shared.open(reportURL)
+    /// URL of the current month's Excel report, if it exists.
+    func currentReportURL() -> URL? {
+        guard let base = accountsDirURL, !selectedFolder.isEmpty else { return nil }
+        let url = base.appendingPathComponent(selectedFolder).appendingPathComponent("\(selectedFolder)_Report.xlsx")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// Open the selected month's report .xlsx in the default app (Numbers, Excel, etc.). Tries Numbers if default fails.
+    /// - Returns: true if opened successfully, false otherwise (e.g. no app to open .xlsx).
+    @discardableResult
+    func openReportFile() -> Bool {
+        let url = currentReportURL() ?? lastReportPath
+        guard let reportURL = url, FileManager.default.fileExists(atPath: reportURL.path) else { return false }
+        if NSWorkspace.shared.open(reportURL) { return true }
+        if let numbersURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Numbers") {
+            let config = NSWorkspace.OpenConfiguration()
+            NSWorkspace.shared.open([reportURL], withApplicationAt: numbersURL, configuration: config)
+            return true
+        }
+        return false
     }
 
     /// Open the last successfully generated report (from menu or UI).
-    func openLastReport() {
-        guard let url = lastReportPath, FileManager.default.fileExists(atPath: url.path) else { return }
-        NSWorkspace.shared.open(url)
+    @discardableResult
+    func openLastReport() -> Bool {
+        guard let url = lastReportPath, FileManager.default.fileExists(atPath: url.path) else { return false }
+        if NSWorkspace.shared.open(url) { return true }
+        if let numbersURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Numbers") {
+            let config = NSWorkspace.OpenConfiguration()
+            NSWorkspace.shared.open([url], withApplicationAt: numbersURL, configuration: config)
+            return true
+        }
+        return false
     }
 
     /// Copy the current (or last) report file path to the pasteboard. Returns true if copied.
@@ -676,6 +699,179 @@ final class AccountsHelper: ObservableObject {
         } catch {
             try? fm.removeItem(at: tempDir)
             return (false, error.localizedDescription)
+        }
+    }
+
+    // MARK: - Insights: merged CSV, audit, month summary, custom mapping
+
+    func mergedCSVURL() -> URL? {
+        guard let base = accountsDirURL, !selectedFolder.isEmpty else { return nil }
+        let url = base.appendingPathComponent(selectedFolder).appendingPathComponent("merged.csv")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    func auditJSONURL() -> URL? {
+        guard let base = accountsDirURL, !selectedFolder.isEmpty else { return nil }
+        let url = base.appendingPathComponent(selectedFolder).appendingPathComponent("audit.json")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    func monthSummaryURL(monthFolder: String) -> URL? {
+        guard let base = accountsDirURL else { return nil }
+        let url = base.appendingPathComponent(monthFolder).appendingPathComponent("month_summary.json")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    func customMappingURL() -> URL? {
+        guard let base = accountsDirURL else { return nil }
+        return base.appendingPathComponent("custom_mapping.json")
+    }
+
+    func loadAuditInfo() -> AuditInfo? {
+        guard let url = auditJSONURL(), let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(AuditInfo.self, from: data)
+    }
+
+    func loadMonthSummary(monthFolder: String) -> MonthSummary? {
+        guard let url = monthSummaryURL(monthFolder: monthFolder), let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(MonthSummary.self, from: data)
+    }
+
+    func loadDeltaInsight() -> DeltaInsight? {
+        guard !selectedFolder.isEmpty, let current = loadMonthSummary(monthFolder: selectedFolder) else { return nil }
+        let prevIdx = monthFolders.firstIndex(of: selectedFolder).map { $0 - 1 }
+        let prevMonth = prevIdx.map { $0 >= 0 ? monthFolders[$0] : nil } ?? nil
+        let prevSummary = prevMonth.flatMap { loadMonthSummary(monthFolder: $0) }
+
+        var spendingDeltaMessage: String?
+        var spendingDeltaPercent: Double?
+        if let prev = prevSummary, prev.totalSpent > 0 {
+            let pct = ((current.totalSpent - prev.totalSpent) / prev.totalSpent) * 100
+            spendingDeltaPercent = pct
+            if pct > 0 { spendingDeltaMessage = "You spent \(Int(round(pct)))% more than last month." }
+            else if pct < 0 { spendingDeltaMessage = "You spent \(Int(round(-pct)))% less than last month." }
+            else { spendingDeltaMessage = "Spending even with last month." }
+        } else if prevMonth == nil { spendingDeltaMessage = "First month — no comparison yet." }
+
+        var categoryAlert: (category: String, delta: Double)?
+        if let prev = prevSummary {
+            for (cat, currAmt) in current.byCategory where currAmt > 0 {
+                let prevAmt = prev.byCategory[cat] ?? 0
+                if currAmt - prevAmt > 50 {
+                    categoryAlert = (cat, currAmt - prevAmt)
+                    break
+                }
+            }
+        }
+
+        return DeltaInsight(
+            spendingDeltaPercent: spendingDeltaPercent,
+            spendingDeltaMessage: spendingDeltaMessage,
+            categoryAlert: categoryAlert,
+            savingsTransfer: current.savingsTransfer > 0 ? current.savingsTransfer : nil
+        )
+    }
+
+    func loadMergedTransactions() -> [MergedTransaction] {
+        guard let url = mergedCSVURL() else { return [] }
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        let lines = content.components(separatedBy: .newlines)
+        guard lines.count >= 2 else { return [] }
+        let headerRow = lines[0]
+        let headerParts = headerRow.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces).lowercased() }
+        let dateIdx = headerParts.firstIndex(where: { $0.contains("date") }) ?? 0
+        let descIdx = headerParts.firstIndex(where: { $0.contains("description") || $0.contains("desc") }) ?? 1
+        let amtIdx = headerParts.firstIndex(where: { $0.contains("amount") }) ?? 2
+        let catIdx = headerParts.firstIndex(where: { $0.contains("category") }) ?? 3
+
+        var result: [MergedTransaction] = []
+        for line in lines.dropFirst() {
+            let parts = line.split(separator: ",", omittingEmptySubsequences: false).map { String($0).trimmingCharacters(in: .whitespaces) }
+            guard parts.count > max(amtIdx, catIdx) else { continue }
+            let amount = Double(parts[amtIdx].replacingOccurrences(of: "$", with: "").replacingOccurrences(of: ",", with: "")) ?? 0
+            result.append(MergedTransaction(
+                date: parts.count > dateIdx ? parts[dateIdx] : "",
+                description: parts.count > descIdx ? parts[descIdx] : "",
+                amount: amount,
+                category: parts.count > catIdx ? parts[catIdx] : CategoryTypes.defaultCategory
+            ))
+        }
+        return result
+    }
+
+    /// Category spending for Quick Look. Prefers month_summary.json (matches Excel report); falls back to merged.csv.
+    func loadCategoryAmounts() -> [CategoryAmount] {
+        if !selectedFolder.isEmpty, let summary = loadMonthSummary(monthFolder: selectedFolder), !summary.byCategory.isEmpty {
+            return summary.byCategory
+                .map { CategoryAmount(category: $0.key, amount: $0.value) }
+                .sorted { $0.amount > $1.amount }
+        }
+        let tx = loadMergedTransactions()
+        var dict: [String: Double] = [:]
+        for t in tx where t.amount < 0 {
+            dict[t.category, default: 0] += abs(t.amount)
+        }
+        return dict.map { CategoryAmount(category: $0.key, amount: $0.value) }.sorted { $0.amount > $1.amount }
+    }
+
+    func loadCustomMapping() -> [String: String] {
+        guard let url = customMappingURL(), let data = try? Data(contentsOf: url) else { return [:] }
+        return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
+    }
+
+    /// Saves one description→category entry. Only writes to custom_mapping.json in Accounts (never touches report or merged.csv).
+    /// Backs up existing file before overwriting. Does not add "Uncategorized" entries.
+    func saveCustomMappingEntry(description: String, category: String) {
+        guard let url = customMappingURL() else { return }
+        let key = description.trimmingCharacters(in: .whitespaces)
+        if key.isEmpty { return }
+        let cat = category.trimmingCharacters(in: .whitespaces)
+        if cat == CategoryTypes.defaultCategory { return }
+        var mapping = loadCustomMapping()
+        mapping[key] = cat
+        guard let data = try? JSONSerialization.data(withJSONObject: mapping, options: .prettyPrinted) else { return }
+        let fm = FileManager.default
+        if fm.fileExists(atPath: url.path) {
+            let backup = url.deletingPathExtension().appendingPathExtension("json.backup")
+            try? fm.removeItem(at: backup)
+            try? fm.copyItem(at: url, to: backup)
+        }
+        try? data.write(to: url)
+    }
+
+    /// Export custom_mapping.json to a user-chosen file (backup or use on another machine).
+    func exportCustomMapping(to url: URL) -> Bool {
+        let mapping = loadCustomMapping()
+        guard let data = try? JSONSerialization.data(withJSONObject: mapping, options: .prettyPrinted) else { return false }
+        do {
+            try data.write(to: url)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Import a JSON file (description → category) and merge into custom_mapping.json. Backs up existing first.
+    func importCustomMapping(from url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url),
+              let imported = try? JSONDecoder().decode([String: String].self, from: data),
+              let dest = customMappingURL() else { return false }
+        var current = loadCustomMapping()
+        for (k, v) in imported where !v.isEmpty && v.lowercased() != "uncategorized" {
+            current[k] = v
+        }
+        guard let out = try? JSONSerialization.data(withJSONObject: current, options: .prettyPrinted) else { return false }
+        let fm = FileManager.default
+        if fm.fileExists(atPath: dest.path) {
+            let backup = dest.deletingPathExtension().appendingPathExtension("json.backup")
+            try? fm.removeItem(at: backup)
+            try? fm.copyItem(at: dest, to: backup)
+        }
+        do {
+            try out.write(to: dest)
+            return true
+        } catch {
+            return false
         }
     }
 }

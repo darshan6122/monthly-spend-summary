@@ -8,6 +8,13 @@ Turn your **CIBC bank CSV exports** into a **monthly spending summary** and Exce
 - **Generate** an Excel report (Transactions, Summary, By Category) with suggested categories so you can see what you spent and where
 - **One data folder** — the app uses a fixed folder in Application Support; you add one folder per month (e.g. "December 2025") with your CSVs inside
 
+### Extra features
+
+- **Smart Category Trainer** — In **Train categories** you can assign a category to any transaction the script didn’t recognize. Corrections are saved to `custom_mapping.json` and the merge script uses them plus an optional TF-IDF/Random Forest model (if `scikit-learn` is installed) so the app gets smarter over time.
+- **Month-over-month insights** — After a report is generated, a **Quick Stats** bar shows spending vs last month, category alerts (e.g. “Dining is up $150”), and **Transfer to Savings** when present.
+- **Data Health** — A **Data Health** view shows a simple reconciliation (total credits vs debits, file count) and warns when duplicate transactions were detected and ignored.
+- **Quick Look dashboard** — A bar chart of spending by category is shown from the merged CSV (no Excel needed). It updates when you switch months with the month pills.
+
 ## Install
 
 1. Download **ExpenseReports-1.0.dmg** (from [Releases](https://github.com/darshan6122/monthly-spend-summary/releases) or your build).
@@ -41,7 +48,8 @@ To build a **drag-and-drop DMG** for distribution:
 
 ## Project structure
 
-- **ExpenseReports/** — main app (SwiftUI views, `AccountsHelper`, `UninstallHelper`)
+- **ExpenseReports/** — main app (SwiftUI views, `AccountsHelper`, `UninstallHelper`, `InsightsModels`)
+- **Scripts/** — reference Python scripts: `merge_and_categorize.py` (merge + categories + audit), `make_monthly_report.py` (Excel + month_summary.json). Copy these (and a `.venv` with `openpyxl`, optionally `scikit-learn`) into your data folder or use **Copy from Desktop** if you have an ACCOUNTS folder on the Desktop.
 - **ExpenseReportsTests/** — unit tests
 - **ExpenseReportsUITests/** — UI tests
 - **create-dmg.sh** — build and create DMG installer (see DMG-README.md)
