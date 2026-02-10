@@ -31,6 +31,8 @@ struct AuditInfo: Codable {
     let duplicateCount: Int
     let filesProcessed: Int
     let transactionCount: Int
+    /// Rows excluded by ignore_list.json.
+    let ignoredCount: Int?
     /// Filled by merge script when using 3-step categorization (Mapping → Regex → ML).
     let categorizedViaMapping: Int?
     let categorizedViaRegex: Int?
@@ -43,6 +45,7 @@ struct AuditInfo: Codable {
         case duplicateCount = "duplicate_count"
         case filesProcessed = "files_processed"
         case transactionCount = "transaction_count"
+        case ignoredCount = "ignored_count"
         case categorizedViaMapping = "categorized_via_mapping"
         case categorizedViaRegex = "categorized_via_regex"
         case categorizedViaMl = "categorized_via_ml"
@@ -73,3 +76,12 @@ struct DeltaInsight {
     let categoryAlert: (category: String, delta: Double)?  // e.g. "Dining Out" up $150
     let savingsTransfer: Double?
 }
+
+// MARK: - Transaction split (one portion of a split transaction)
+struct TransactionSplitPart: Codable {
+    let category: String
+    let amount: Double
+}
+
+// MARK: - Transaction splits per month: key = "date|description|amount", value = array of parts (must sum to original amount)
+typealias TransactionSplitsMap = [String: [TransactionSplitPart]]

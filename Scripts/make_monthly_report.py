@@ -30,8 +30,8 @@ from collections import defaultdict
 _raw = os.environ.get("EXPENSE_REPORTS_ACCOUNTS_DIR")
 ACCOUNTS_DIR = Path(_raw).resolve() if _raw else Path(__file__).resolve().parent
 
-# Order matters: first match wins. Put specific patterns before generic ones.
-CATEGORY_RULES = [
+# Built-in rules (used if category_rules.json is not present in Accounts folder).
+_BUILTIN_CATEGORY_RULES = [
     # Work income (only this counts as "work" — shown separately in Summary)
     (r"(?i)electronic funds transfer pay windreg|pay windreg", "Work Income"),
     # Other money in = from savings accounts or from friends (excluded from main Income total)
@@ -61,24 +61,35 @@ CATEGORY_RULES = [
 # Fallback: catch remaining transfer-like (don't match "internet banking bill pay")
 TRANSFER_FALLBACK = (r"(?i)e-transfer|internet transfer\s|interac\s+transfer", "Transfers & Payments")
 
-# All categories for dropdown in Transactions (so you pick from list instead of typing)
-ALL_CATEGORIES = [
-    "Work Income",
-    "Transfers & Payments",
-    "Shopping & Groceries",
-    "Food & Drink",
-    "Restaurants",
-    "Transport & Travel",
-    "Subscriptions & Bills",
-    "Utilities & Bills",
-    "Entertainment",
-    "Fees & Interest",
-    "Health",
-    "Pharmacy",
-    "Personal Care",
-    "Gas & Auto",
+_BUILTIN_ALL_CATEGORIES = [
+    "Work Income", "Transfers & Payments", "Shopping & Groceries", "Food & Drink",
+    "Restaurants", "Transport & Travel", "Subscriptions & Bills", "Utilities & Bills",
+    "Entertainment", "Fees & Interest", "Health", "Pharmacy", "Personal Care", "Gas & Auto",
     "Uncategorized",
 ]
+
+
+def _load_category_config() -> tuple[list, list]:
+    """Load (rules, all_categories) from ACCOUNTS_DIR/category_rules.json if present; else built-in."""
+    path = ACCOUNTS_DIR / "category_rules.json"
+    if not path.exists():
+        return (_BUILTIN_CATEGORY_RULES, _BUILTIN_ALL_CATEGORIES)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        rules = []
+        for r in data.get("rules", []):
+            if isinstance(r, dict) and r.get("pattern") and r.get("category"):
+                rules.append((str(r["pattern"]), str(r["category"])))
+        categories = list(data.get("categories", []))
+        return (rules if rules else _BUILTIN_CATEGORY_RULES, categories if categories else _BUILTIN_ALL_CATEGORIES)
+    except (json.JSONDecodeError, OSError):
+        return (_BUILTIN_CATEGORY_RULES, _BUILTIN_ALL_CATEGORIES)
+
+
+# Defaults; run() overwrites from category_rules.json when present.
+CATEGORY_RULES = _BUILTIN_CATEGORY_RULES
+ALL_CATEGORIES = list(_BUILTIN_ALL_CATEGORIES)
 
 
 def suggest_category(description: str) -> str:
@@ -151,26 +162,31 @@ def get_month_folders() -> list[Path]:
     return sorted(month_folders, key=lambda p: (p.name.split()[-1], p.name))
 
 
+# Dark-mode friendly: light gray fill + dark text so Excel Dark Mode looks good
 def style_header(cell):
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-    cell.font = Font(bold=True, color="FFFFFF")
-    cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    cell.font = Font(bold=True, color="1F2933")
+    cell.fill = PatternFill(start_color="D1D5DB", end_color="D1D5DB", fill_type="solid")
     cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
     thin = Side(style="thin")
     cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
 
 def style_currency(cell):
-    from openpyxl.styles import Alignment, Border, Side
+    from openpyxl.styles import Alignment, Border, Side, PatternFill, Font
     cell.number_format = '"$"#,##0.00'
     cell.alignment = Alignment(horizontal="right", vertical="center")
+    cell.fill = PatternFill(start_color="F3F4F6", end_color="F3F4F6", fill_type="solid")
+    cell.font = Font(color="1F2933")
     thin = Side(style="thin")
     cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
 
 def style_date_cell(cell):
-    from openpyxl.styles import Alignment, Border, Side
+    from openpyxl.styles import Alignment, Border, Side, PatternFill, Font
     cell.alignment = Alignment(horizontal="left", vertical="center")
+    cell.fill = PatternFill(start_color="F3F4F6", end_color="F3F4F6", fill_type="solid")
+    cell.font = Font(color="1F2933")
     thin = Side(style="thin")
     cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
@@ -178,8 +194,8 @@ def style_date_cell(cell):
 def style_subtotal_cell(cell, bold=True):
     from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
     if bold:
-        cell.font = Font(bold=True)
-    cell.fill = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
+        cell.font = Font(bold=True, color="1F2933")
+    cell.fill = PatternFill(start_color="E5E7EB", end_color="E5E7EB", fill_type="solid")
     cell.alignment = Alignment(horizontal="right", vertical="center")
     thin = Side(style="thin")
     cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -187,6 +203,7 @@ def style_subtotal_cell(cell, bold=True):
 
 
 def run():
+    global CATEGORY_RULES, ALL_CATEGORIES
     try:
         import openpyxl
         from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -197,9 +214,15 @@ def run():
         print("Need openpyxl. Run:  .venv/bin/pip install openpyxl", file=sys.stderr)
         sys.exit(1)
 
+    CATEGORY_RULES, ALL_CATEGORIES = _load_category_config()
+
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if args:
-        month_path = ACCOUNTS_DIR / args[0].strip()
+        folder_arg = args[0].strip()
+        if not folder_arg:
+            print("Error: Month folder name cannot be empty.", file=sys.stderr)
+            sys.exit(1)
+        month_path = ACCOUNTS_DIR / folder_arg
     else:
         month_folders = get_month_folders()
         if not month_folders:
@@ -221,25 +244,94 @@ def run():
         print(f"Folder not found: {month_path}", file=sys.stderr)
         sys.exit(1)
 
+    print(f"Report folder: {month_path.name}", file=sys.stderr)
     csv_files = sorted(month_path.glob("cibc*.csv"))
-    if not csv_files:
-        print("No cibc*.csv in that folder.", file=sys.stderr)
-        sys.exit(1)
+    use_merged = os.environ.get("USE_MERGED_CATEGORIES", "").strip().lower() in ("1", "true", "yes")
+    combined_path = month_path / f"{month_path.name}_combined.csv"
 
-    all_rows = []
-    for f in csv_files:
-        all_rows.extend(read_cibc_csv(f))
-    all_rows.sort(key=lambda r: (r["Date"], r["Description"]))
+    # Load transaction_splits.json: expand any row with splits into multiple rows
+    splits_map = {}
+    splits_path = month_path / "transaction_splits.json"
+    if splits_path.exists():
+        try:
+            with open(splits_path, encoding="utf-8") as sf:
+                splits_map = json.load(sf)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    def expand_splits(rows):
+        out = []
+        for r in rows:
+            key = f"{r['Date']}|{r['Description']}|{r['Amount']}"
+            key_alt = f"{r['Date']}|{r['Description']}|{int(r['Amount'])}"
+            parts = splits_map.get(key) or splits_map.get(key_alt)
+            if parts and isinstance(parts, list) and len(parts) > 0:
+                for part in parts:
+                    cat = part.get("category") or "Uncategorized"
+                    amt = float(part.get("amount", 0))
+                    if r["Amount"] < 0:
+                        amt = -abs(amt)
+                    out.append({
+                        "Date": r["Date"],
+                        "Description": r["Description"],
+                        "Account": r["Account"],
+                        "Category": cat,
+                        "Amount": amt,
+                    })
+            else:
+                out.append(r)
+        return out
+
+    if use_merged and combined_path.exists():
+        all_rows = []
+        with open(combined_path, newline="", encoding="utf-8", errors="replace") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                debit = parse_amount(row.get("Debit", "") or "0")
+                credit = parse_amount(row.get("Credit", "") or "0")
+                amount = credit - debit
+                all_rows.append({
+                    "Date": (row.get("Date") or "").strip(),
+                    "Description": (row.get("Description") or "").strip(),
+                    "Account": (row.get("Source") or row.get("Account", "")).strip() or "—",
+                    "Category": (row.get("Suggested Category") or "").strip() or "Uncategorized",
+                    "Amount": amount,
+                })
+        all_rows = expand_splits(all_rows)
+        all_rows.sort(key=lambda r: (r["Date"], r["Description"]))
+        print("Using categories from merge (_combined.csv).")
+    else:
+        if not csv_files:
+            print("No cibc*.csv in that folder.", file=sys.stderr)
+            sys.exit(1)
+        all_rows = []
+        for f in csv_files:
+            all_rows.extend(read_cibc_csv(f))
+        all_rows = expand_splits(all_rows)
+        all_rows.sort(key=lambda r: (r["Date"], r["Description"]))
 
     # Fixed range for formulas (so changing Transactions updates Summary & By Category)
     MAX_ROW = 2000
     TX = "Transactions"  # sheet name for formula refs
 
-    wb = openpyxl.Workbook()
+    template_path = ACCOUNTS_DIR / "template.xlsx"
+    if template_path.exists():
+        try:
+            wb = openpyxl.load_workbook(template_path)
+            for name in ["Transactions", "Summary", "By Category"]:
+                if name in wb.sheetnames:
+                    del wb[name]
+            ws_tx = wb.create_sheet("Transactions", 0)
+        except Exception:
+            wb = openpyxl.Workbook()
+            ws_tx = wb.active
+            ws_tx.title = "Transactions"
+    else:
+        wb = openpyxl.Workbook()
+        ws_tx = wb.active
+        ws_tx.title = "Transactions"
 
     # ----- Sheet 1: Transactions (source of truth; edit Category here) -----
-    ws_tx = wb.active
-    ws_tx.title = "Transactions"
     tx_headers = ["Date", "Description", "Account", "Category", "Amount"]
     for c, h in enumerate(tx_headers, 1):
         cell = ws_tx.cell(row=1, column=c, value=h)
@@ -438,6 +530,17 @@ def run():
     with open(month_path / "month_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
+    # Optional: HTML dashboard with Plotly
+    try:
+        import plotly.graph_objects as go
+        import plotly.offline
+        fig = go.Figure(data=[go.Bar(x=list(by_category.keys()), y=list(by_category.values()), marker_color="rgb(59, 130, 246)")])
+        fig.update_layout(title=f"{month_path.name} — Spending by category", xaxis_title="Category", yaxis_title="Amount ($)", template="plotly_white", font=dict(size=12))
+        html_path = month_path / "dashboard.html"
+        fig.write_html(str(html_path), config={"displayModeBar": True})
+        print(f"  – Dashboard: {html_path}")
+    except ImportError:
+        pass
 
 if __name__ == "__main__":
     run()

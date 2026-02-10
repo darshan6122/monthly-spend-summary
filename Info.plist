@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
 <dict>
+	<key>UIAppFonts</key>
+	<array>
+		<string>SpaceGrotesk-Medium.otf</string>
+		<string>SpaceGrotesk-SemiBold.otf</string>
+		<string>Inter-Regular.otf</string>
+	</array>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

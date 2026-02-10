@@ -4,3 +4,9 @@ openpyxl>=3.0.0
 
 # Optional: for Smart Category (TF-IDF + Random Forest). If not installed, merge uses keyword + custom_mapping only.
 scikit-learn>=1.0.0
+
+# Optional: for HTML dashboard (dashboard.html per month).
+plotly>=5.0.0
+
+# Optional: for PDF statement import (More → drop PDF; extracts table to CSV).
+pdfplumber>=0.10.0

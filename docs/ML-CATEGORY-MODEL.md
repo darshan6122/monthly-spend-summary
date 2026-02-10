@@ -2,11 +2,10 @@
 
 ## Current state
 
-- **Merge script** (`Scripts/merge_and_categorize.py`): **regex-only**. It uses a fixed list of `CATEGORY_RULES` (regex pattern → category). No ML, no `custom_mapping.json`.
-- **App Training sheet**: Lets you assign a category to a transaction description and writes to **`custom_mapping.json`** in the Accounts folder. The **current** merge script does **not** read this file, so training does not affect merge output until you wire it back in.
-- **Report script** (`make_monthly_report.py`): Reads **raw** CIBC CSVs and uses its own regex rules; it does not use the merge output for categorization. So the Excel report’s categories come from `make_monthly_report.py`’s rules, not from the merge script.
+- **Merge script** (`Scripts/merge_and_categorize.py`): **3-step waterfall** — (1) Custom mapping from `custom_mapping.json`, (2) Regex rules (or `category_rules.json`), (3) ML fallback (char TF-IDF + LogisticRegression). Model cached in `.ml_cache/classifier.pkl`. Optional **`category_rules.json`** in the Accounts folder: `{"categories": [...], "rules": [{"pattern": "...", "category": "..."}]}` — see `docs/category_rules.example.json`.
+- **App Training sheet**: Lets you assign a category to a transaction description and writes to **`custom_mapping.json`** in the Accounts folder. Merge script uses it in step 1.
+- **Report script** (`make_monthly_report.py`): When **`USE_MERGED_CATEGORIES=1`** (app), uses the merge's Suggested Category; otherwise re-categorizes from raw CSVs. Both scripts can load **`category_rules.json`** from the Accounts folder.
 
-So today there is **no ML model in the pipeline**. The doc below describes the **intended** design so you can add or improve it.
 
 ---
 
@@ -27,24 +26,15 @@ Predict **category** for a transaction from its **description** (e.g. `"STARBUCK
 - **Training data**: Pairs `(description, category)` from:
   - **custom_mapping.json**: `{ "description_substring_or_full": "Category" }`. Each key can be used as one training example (description = key, label = category). Optionally you can also use **historical merged/Excel data** (description + category from past months) if you export it.
 
-### Model (as originally sketched)
+### Model (current implementation)
 
-- **Step 1 – Custom mapping**: If the transaction description **contains** a key from `custom_mapping.json` (or exact match), return that category. User corrections always override.
-- **Step 2 – Regex rules**: If any of the fixed regex rules (e.g. `tim hortons|starbucks|...`) matches, return that category.
-- **Step 3 – ML fallback** (optional): If step 1 and 2 give nothing (e.g. "Uncategorized"), call a **classifier** that predicts category from the **raw description string**.
-  - **Features**: **TF-IDF** over the description (unigrams + bigrams). Example: `TfidfVectorizer(max_features=500, ngram_range=(1, 2))`.
-  - **Classifier**: **Random Forest** (e.g. `RandomForestClassifier(n_estimators=50, max_depth=10)`). Trained only on examples from `custom_mapping` (and optionally other labeled data).
-  - **Training**: When the script runs, load `custom_mapping.json`, build a list of `(description, category)` pairs, then `fit(descriptions, categories)`. If there are fewer than ~3–5 examples (or too few per class), skip the ML step and return "Uncategorized".
-  - **Inference**: For each new description that reached step 3, call `predict([description])` and map the predicted label to one of the allowed categories; if the predicted label is not in the allowed set, return "Uncategorized".
+- **Step 1 – Custom mapping**: If the transaction description **contains** a key from `custom_mapping.json` (longest match first), return that category.
+- **Step 2 – Regex rules**: If any rule in `CATEGORY_RULES` (or from `category_rules.json`) matches, return that category.
+- **Step 3 – ML fallback**: If step 1 and 2 give "Uncategorized", use **TfidfVectorizer** (char n-grams) + **LogisticRegression**. Trained on custom_mapping plus (description, category) from the last 3 months’ merged.csv. Cached in `.ml_cache/classifier.pkl`; only retrains when training data hash changes. Predictions are accepted only when confidence > 0.70 and the predicted category is in `ALL_CATEGORIES`.
 
 ### Where it lives
 
-- **Merge script** is the right place: it already assigns a "Suggested Category" per row. So:
-  - In `merge_and_categorize.py`, after loading `CATEGORY_RULES`, also load `custom_mapping.json` (from `ACCOUNTS_DIR`).
-  - In the categorization function:
-    1. Check custom_mapping (substring or exact match).
-    2. Then regex rules.
-    3. Then, if you have sklearn and enough training data, run the TF-IDF + Random Forest model; otherwise return "Uncategorized".
+- **Merge script** (`merge_and_categorize.py`): Loads `custom_mapping.json` (from month folder or Accounts root), loads rules/categories from `category_rules.json` if present, then for each transaction: (1) custom mapping, (2) regex, (3) ML with cached model. Writes `audit.json` with counts (mapping / regex / ML / uncategorized) for the app’s Data Health view.
 
 ### Hyperparameters (for your improvements)
 

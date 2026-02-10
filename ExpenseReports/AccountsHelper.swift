@@ -6,18 +6,23 @@
 //
 
 import Combine
+import CoreText
 import Foundation
 import AppKit
 import UniformTypeIdentifiers
 import UserNotifications
 
 final class AccountsHelper: ObservableObject {
+    private static let monthlyReminderID = "ExpenseReports.monthlyReportReminder"
+
     @Published var monthFolders: [String] = []
     @Published var selectedFolder: String = ""
     @Published var statusMessage: String = ""
     @Published var isWorking: Bool = false
     @Published var stepMessage: String = ""
     @Published var lastScriptOutput: String = ""
+    /// True when the last script run failed (non-zero exit). Used to show "Script failed" in Log.
+    @Published var lastScriptFailed: Bool = false
     /// Shown when setup is needed (e.g. scripts missing). Empty when ready.
     @Published var setupInstructions: String = ""
     /// Path to the app's accounts folder (where you put month folders). Always valid.
@@ -30,10 +35,16 @@ final class AccountsHelper: ObservableObject {
     @Published var errorRecoveryHint: String = ""
     /// Path to the last successfully generated report (for "Open last report").
     @Published var lastReportPath: URL?
+    /// Path to the last generated PDF report (from generate_spending_report_pdf_FULL.py when present).
+    @Published var lastPDFPath: URL?
     /// When set to true, the UI should present the in-app report summary sheet (no Excel needed).
     @Published var requestShowReportSummary: Bool = false
+    /// When Downloads watcher finds a new cibc*.csv, set here; UI shows "Move to [Current Month]?" and clears on action.
+    @Published var detectedDownloadedCSV: URL?
 
     private var accountsDirURL: URL?
+    private var downloadsWatcherTimer: Timer?
+    private var downloadedCSVNotifiedPaths: Set<String> = []
 
     private static let recentFoldersKey = "ExpenseReports.recentFolders"
     private static let pinnedFolderKey = "ExpenseReports.pinnedFolder"
@@ -50,6 +61,9 @@ final class AccountsHelper: ObservableObject {
 
     init() {
         ensureAccountsFolderAndLoad()
+        if AppSettings.watchDownloadsFolder {
+            DispatchQueue.main.async { [weak self] in self?.updateDownloadsWatcher() }
+        }
     }
 
     /// Create the app's Accounts folder if needed and load month folders from it.
@@ -81,26 +95,32 @@ final class AccountsHelper: ObservableObject {
         let needsMerge = !fm.fileExists(atPath: dir.appendingPathComponent("merge_and_categorize.py").path)
         let needsReport = !fm.fileExists(atPath: dir.appendingPathComponent("make_monthly_report.py").path)
         if needsMerge || needsReport {
-            setupInstructions = "Copy the environment from your Desktop ACCOUNTS folder (make_monthly_report.py, merge_and_categorize.py, .venv) into the data folder, then open the data folder and add month folders."
+            setupInstructions = "Copy the Scripts folder and .venv from Desktop/ACCOUNTS/ExpenseReports into the data folder (Open Data Folder), then add month folders with your CSVs."
         } else {
             setupInstructions = ""
         }
     }
 
-    /// Copy scripts and .venv from ~/Desktop/ACCOUNTS into the app's Accounts folder.
+    /// Project root: all app scripts and assets live under Desktop/ACCOUNTS/ExpenseReports.
+    /// Copy scripts from ExpenseReports/Scripts and .venv from ExpenseReports into the app's data folder.
     func copySetupFromDesktop() -> (success: Bool, message: String) {
         guard let dest = accountsDirURL else { return (false, "Accounts folder not found.") }
-        let desktopAccounts = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Desktop/ACCOUNTS", isDirectory: true)
         let fm = FileManager.default
-        guard fm.fileExists(atPath: desktopAccounts.path) else {
-            return (false, "Desktop/ACCOUNTS folder not found.")
+        let home = fm.homeDirectoryForCurrentUser
+        // Canonical project location: ~/Desktop/ACCOUNTS/ExpenseReports
+        let projectRoot = home.appendingPathComponent("Desktop/ACCOUNTS/ExpenseReports", isDirectory: true)
+        let scriptsDir = projectRoot.appendingPathComponent("Scripts", isDirectory: true)
+        guard fm.fileExists(atPath: projectRoot.path) else {
+            return (false, "Desktop/ACCOUNTS/ExpenseReports folder not found.")
         }
-        let toCopy = ["make_monthly_report.py", "merge_and_categorize.py", ".venv"]
-        for name in toCopy {
-            let src = desktopAccounts.appendingPathComponent(name, isDirectory: name == ".venv")
+        guard fm.fileExists(atPath: scriptsDir.path) else {
+            return (false, "ExpenseReports/Scripts folder not found.")
+        }
+        let scriptNames = ["make_monthly_report.py", "merge_and_categorize.py", "pdf_to_csv.py"]
+        for name in scriptNames {
+            let src = scriptsDir.appendingPathComponent(name, isDirectory: false)
             guard fm.fileExists(atPath: src.path) else { continue }
-            let dst = dest.appendingPathComponent(name, isDirectory: name == ".venv")
+            let dst = dest.appendingPathComponent(name, isDirectory: false)
             do {
                 if fm.fileExists(atPath: dst.path) { try fm.removeItem(at: dst) }
                 try fm.copyItem(at: src, to: dst)
@@ -108,9 +128,22 @@ final class AccountsHelper: ObservableObject {
                 return (false, "Failed to copy \(name): \(error.localizedDescription)")
             }
         }
+        // Copy .venv from ExpenseReports or from Desktop/ACCOUNTS
+        let venvInProject = projectRoot.appendingPathComponent(".venv", isDirectory: true)
+        let venvInAccounts = home.appendingPathComponent("Desktop/ACCOUNTS/.venv", isDirectory: true)
+        let venvSrc = fm.fileExists(atPath: venvInProject.path) ? venvInProject : venvInAccounts
+        if fm.fileExists(atPath: venvSrc.path) {
+            let venvDst = dest.appendingPathComponent(".venv", isDirectory: true)
+            do {
+                if fm.fileExists(atPath: venvDst.path) { try fm.removeItem(at: venvDst) }
+                try fm.copyItem(at: venvSrc, to: venvDst)
+            } catch {
+                return (false, "Failed to copy .venv: \(error.localizedDescription)")
+            }
+        }
         updateSetupInstructions(dir: dest)
         loadMonthFolders(from: dest)
-        return (true, "Copied from Desktop ACCOUNTS.")
+        return (true, "Copied from Desktop/ACCOUNTS/ExpenseReports.")
     }
 
     func retryLastAction() {
@@ -194,7 +227,7 @@ final class AccountsHelper: ObservableObject {
             else { UserDefaults.standard.removeObject(forKey: Self.pinnedFolderKey) }
         }
     }
-    
+     
     /// Resolve symlinks until we get the real binary.
     private func resolveToRealBinary(_ url: URL) -> URL? {
         let fm = FileManager.default
@@ -253,14 +286,14 @@ final class AccountsHelper: ObservableObject {
         s.replacingOccurrences(of: "'", with: "'\"'\"'")
     }
 
-    private func runScript(name: String, folder: String) -> (success: Bool, message: String) {
+    private func runScript(name: String, folder: String, useMergedCategories: Bool = false) -> (success: Bool, message: String) {
         guard let base = accountsDirURL else { return (false, "ACCOUNTS folder not found.") }
         let scriptURL = base.appendingPathComponent(name)
         guard FileManager.default.fileExists(atPath: scriptURL.path) else {
             DispatchQueue.main.async { [weak self] in
-                self?.errorRecoveryHint = "Copy make_monthly_report.py and merge_and_categorize.py from your Desktop ACCOUNTS folder into the data folder (Open Data Folder → paste files)."
+                self?.errorRecoveryHint = "Copy the Scripts folder from Desktop/ACCOUNTS/ExpenseReports into the data folder (Open Data Folder → paste script files)."
             }
-            return (false, "Put make_monthly_report.py and merge_and_categorize.py in the accounts folder.")
+            return (false, "Copy Scripts from Desktop/ACCOUNTS/ExpenseReports into the data folder.")
         }
         guard let (pythonPath, venvPath) = findWorkingPython(base: base) else {
             DispatchQueue.main.async { [weak self] in
@@ -271,6 +304,11 @@ final class AccountsHelper: ObservableObject {
         DispatchQueue.main.async { [weak self] in self?.errorRecoveryHint = "" }
         // Run via /bin/sh so we never exec Python directly (avoids "python3.13 doesn't exist" dialog).
         var exports = "export EXPENSE_REPORTS_ACCOUNTS_DIR='\(shellEscape(base.path))'; "
+        if useMergedCategories { exports += "export USE_MERGED_CATEGORIES=1; " }
+        if name == "merge_and_categorize.py" {
+            let threshold = String(format: "%.2f", max(0, min(1, AppSettings.mlConfidenceThreshold)))
+            exports += "export ML_CONFIDENCE_THRESHOLD='\(threshold)'; "
+        }
         if let venv = venvPath {
             exports += "export VIRTUAL_ENV='\(shellEscape(venv))'; "
             if let sitePackages = venvSitePackages(venvPath: venv) {
@@ -278,10 +316,15 @@ final class AccountsHelper: ObservableObject {
             }
         }
         let cmd = "\(exports)exec '\(shellEscape(pythonPath))' '\(shellEscape(scriptURL.path))' '\(shellEscape(folder))'"
+        return runProcessWithOutput(cwd: base, command: cmd)
+    }
+
+    /// Run a shell command and return (success, stdout message). Used by runScript and runPDFToCSV.
+    private func runProcessWithOutput(cwd: URL, command: String) -> (success: Bool, message: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", cmd]
-        process.currentDirectoryURL = base
+        process.arguments = ["-c", command]
+        process.currentDirectoryURL = cwd
         let pipe = Pipe()
         let errPipe = Pipe()
         process.standardOutput = pipe
@@ -296,12 +339,146 @@ final class AccountsHelper: ObservableObject {
             let combined = (out + (err.isEmpty ? "" : "\n--- stderr ---\n" + err)).trimmingCharacters(in: .whitespacesAndNewlines)
             DispatchQueue.main.async { [weak self] in
                 self?.lastScriptOutput = combined.isEmpty ? "(no output)" : combined
+                self?.lastScriptFailed = (process.terminationStatus != 0)
             }
             if process.terminationStatus == 0 {
                 return (true, out.isEmpty ? "Done." : out.trimmingCharacters(in: .whitespacesAndNewlines))
             }
             return (false, err.isEmpty ? out : err)
         } catch {
+            return (false, error.localizedDescription)
+        }
+    }
+
+    /// Run pdf_to_csv.py to extract table from PDF; creates month folder and writes cibc_pdf_export.csv. Returns (success, message, monthFolderName?).
+    func importDroppedPDF(_ url: URL) -> (success: Bool, message: String, monthFolder: String?) {
+        guard url.isFileURL, let base = accountsDirURL else { return (false, "Invalid file or Accounts folder missing.", nil) }
+        let path = url.path
+        guard path.lowercased().hasSuffix(".pdf") else { return (false, "Not a PDF file.", nil) }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else { return (false, "File not found.", nil) }
+        let scriptURL = base.appendingPathComponent("pdf_to_csv.py")
+        guard fm.fileExists(atPath: scriptURL.path) else {
+            return (false, "Copy Scripts (pdf_to_csv.py) into the data folder. Install: pip install pdfplumber", nil)
+        }
+        guard let (pythonPath, venvPath) = findWorkingPython(base: base) else {
+            return (false, "No Python found. Install Python and pdfplumber.", nil)
+        }
+        var exports = "export EXPENSE_REPORTS_ACCOUNTS_DIR='\(shellEscape(base.path))'; "
+        if let venv = venvPath {
+            exports += "export VIRTUAL_ENV='\(shellEscape(venv))'; "
+            if let sitePackages = venvSitePackages(venvPath: venv) {
+                exports += "export PYTHONPATH='\(shellEscape(sitePackages))'; "
+            }
+        }
+        let cmd = "\(exports)exec '\(shellEscape(pythonPath))' '\(shellEscape(scriptURL.path))' '\(shellEscape(path))'"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", cmd]
+        process.currentDirectoryURL = base
+        let pipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = errPipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let outData = pipe.fileHandleForReading.readDataToEndOfFile()
+            let out = String(data: outData, encoding: .utf8) ?? ""
+            let monthLine = out.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? ""
+            if process.terminationStatus != 0 {
+                let err = (try? errPipe.fileHandleForReading.readDataToEndOfFile()).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                return (false, err.isEmpty ? "PDF extraction failed." : err, nil)
+            }
+            loadMonthFolders(from: base)
+            if !monthFolders.contains(monthLine) { monthFolders.append(monthLine); monthFolders.sort() }
+            selectedFolder = monthLine
+            statusMessage = "✓ PDF imported to \(monthLine)."
+            return (true, "Imported to \(monthLine).", monthLine)
+        } catch {
+            return (false, error.localizedDescription, nil)
+        }
+    }
+
+    /// Export a zip of the Accounts folder with all CSV description columns replaced by "Vendor 1", "Vendor 2", etc. (stable by content). Saves to destinationURL.
+    func exportAnonymizedForDebugging(destinationURL: URL) -> (success: Bool, message: String) {
+        guard let base = accountsDirURL else { return (false, "Accounts folder not found.") }
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent("ExpenseReports_anon_\(UUID().uuidString.prefix(8))")
+        do {
+            try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        } catch {
+            return (false, "Could not create temp dir: \(error.localizedDescription)")
+        }
+        defer { try? fm.removeItem(at: tempDir) }
+        var descToVendor: [String: String] = [:]
+        /// Description column index (0-based) from header; -1 if not found.
+        func descriptionColumnIndex(from headerLine: String) -> Int {
+            let lower = headerLine.lowercased()
+            if lower.contains("description") { return 1 }
+            let parts = headerLine.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+            if let i = parts.firstIndex(where: { $0.lowercased().contains("desc") }) { return i }
+            return parts.count >= 2 ? 1 : -1
+        }
+        func anonymizeCSV(source: URL, dest: URL) {
+            guard let content = try? String(contentsOf: source, encoding: .utf8) else { return }
+            let lines = content.components(separatedBy: .newlines)
+            guard !lines.isEmpty else { return }
+            let header = lines[0]
+            let descIdx = descriptionColumnIndex(from: header)
+            if descIdx < 0 { try? content.write(to: dest, atomically: true, encoding: .utf8); return }
+            var out: [String] = [header]
+            for line in lines.dropFirst() {
+                if line.isEmpty { out.append(line); continue }
+                var parts = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+                if descIdx < parts.count {
+                    let orig = parts[descIdx]
+                    let label = descToVendor[orig] ?? {
+                        let n = descToVendor.count + 1
+                        let v = "Vendor \(n)"
+                        descToVendor[orig] = v
+                        return v
+                    }()
+                    parts[descIdx] = label
+                }
+                out.append(parts.joined(separator: ","))
+            }
+            try? out.joined(separator: "\n").write(to: dest, atomically: true, encoding: .utf8)
+        }
+        func copyTree(src: URL, dest: URL) {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: src.path, isDirectory: &isDir) else { return }
+            if isDir.boolValue {
+                try? fm.createDirectory(at: dest, withIntermediateDirectories: true)
+                (try? fm.contentsOfDirectory(at: src, includingPropertiesForKeys: nil))?.forEach { child in
+                    copyTree(src: child, dest: dest.appendingPathComponent(child.lastPathComponent))
+                }
+            } else {
+                if src.pathExtension.lowercased() == "csv" {
+                    anonymizeCSV(source: src, dest: dest)
+                } else {
+                    try? fm.copyItem(at: src, to: dest)
+                }
+            }
+        }
+        copyTree(src: base, dest: tempDir)
+        let zipURL = fm.temporaryDirectory.appendingPathComponent("ExpenseReports_debug_\(UUID().uuidString.prefix(8)).zip")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+        process.arguments = ["-r", "-q", zipURL.path, "."]
+        process.currentDirectoryURL = tempDir
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus != 0 {
+                try? fm.removeItem(at: zipURL)
+                return (false, "zip failed.")
+            }
+            if fm.fileExists(atPath: destinationURL.path) { try? fm.removeItem(at: destinationURL) }
+            try fm.moveItem(at: zipURL, to: destinationURL)
+            return (true, "Exported to \(destinationURL.lastPathComponent)")
+        } catch {
+            try? fm.removeItem(at: zipURL)
             return (false, error.localizedDescription)
         }
     }
@@ -327,7 +504,7 @@ final class AccountsHelper: ObservableObject {
                 return
             }
             DispatchQueue.main.async { self.stepMessage = "Generating report…" }
-            let reportResult = self.runScript(name: "make_monthly_report.py", folder: self.selectedFolder)
+            let reportResult = self.runScript(name: "make_monthly_report.py", folder: self.selectedFolder, useMergedCategories: true)
             DispatchQueue.main.async {
                 self.isWorking = false
                 self.stepMessage = ""
@@ -341,8 +518,27 @@ final class AccountsHelper: ObservableObject {
                         Self.sendReportReadyNotification(month: folderName)
                     }
                     if AppSettings.openFolderAfterReport { self.openMonthFolderInFinder() }
+                    DispatchQueue.global(qos: .utility).async { [weak self] in
+                        self?.runPDFScriptIfPresent(folder: folderName)
+                    }
                 } else {
                     self.statusMessage = "✗ \(reportResult.message)"
+                }
+            }
+        }
+    }
+
+    /// If generate_spending_report_pdf_FULL.py exists in Accounts folder, run it for the given folder and set lastPDFPath (on main).
+    private func runPDFScriptIfPresent(folder: String) {
+        guard let base = accountsDirURL else { return }
+        let scriptURL = base.appendingPathComponent("generate_spending_report_pdf_FULL.py", isDirectory: false)
+        guard FileManager.default.fileExists(atPath: scriptURL.path) else { return }
+        let result = runScript(name: "generate_spending_report_pdf_FULL.py", folder: folder)
+        if result.success {
+            let candidate = base.appendingPathComponent(folder).appendingPathComponent("\(folder)_Report.pdf", isDirectory: false)
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                DispatchQueue.main.async { [weak self] in
+                    self?.lastPDFPath = candidate
                 }
             }
         }
@@ -359,7 +555,7 @@ final class AccountsHelper: ObservableObject {
         let folderName = selectedFolder
         lastFailedAction = { [weak self] in self?.generateReport() }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = self?.runScript(name: "make_monthly_report.py", folder: self?.selectedFolder ?? "") ?? (success: false, message: "Error")
+            let result = self?.runScript(name: "make_monthly_report.py", folder: self?.selectedFolder ?? "", useMergedCategories: true) ?? (success: false, message: "Error")
             DispatchQueue.main.async {
                 self?.isWorking = false
                 self?.stepMessage = ""
@@ -400,9 +596,23 @@ final class AccountsHelper: ObservableObject {
                 if result.success {
                     self?.lastFailedAction = nil
                     self?.lastRunDate = Date()
+                    Self.sendMergeCompleteNotification(month: self?.selectedFolder ?? "")
                 }
             }
         }
+    }
+
+    private static func sendMergeCompleteNotification(month: String) {
+        if !UserDefaults.standard.bool(forKey: hasRequestedNotificationKey) {
+            UserDefaults.standard.set(true, forKey: hasRequestedNotificationKey)
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
+        let content = UNMutableNotificationContent()
+        content.title = "Merge complete"
+        content.body = "\(month): CSVs merged and categorized."
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: "merge-\(UUID().uuidString)", content: content, trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.5, repeats: false))
+        UNUserNotificationCenter.current().add(request)
     }
 
     /// If the dropped URL is a month folder inside our accounts dir, select it. Returns true if selected.
@@ -420,6 +630,160 @@ final class AccountsHelper: ObservableObject {
         selectedFolder = firstComponent
         statusMessage = ""
         return true
+    }
+
+    /// Import a dropped CSV: detect month from first date in file (or file creation date), create month folder if needed, copy file as cibc*.csv.
+    func importDroppedCSV(_ url: URL) -> (success: Bool, message: String) {
+        guard url.isFileURL, let base = accountsDirURL else { return (false, "Invalid file or Accounts folder missing.") }
+        let path = url.path
+        guard path.lowercased().hasSuffix(".csv") else { return (false, "Not a CSV file.") }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else { return (false, "File not found.") }
+
+        let folderName: String
+        if let fromContent = parseFirstDateFromCSV(at: url) {
+            folderName = monthFolderName(from: fromContent)
+        } else if let attrs = try? fm.attributesOfItem(atPath: path), let created = attrs[.creationDate] as? Date {
+            folderName = monthFolderName(from: created)
+        } else {
+            folderName = monthFolderName(from: Date())
+        }
+
+        let monthURL = base.appendingPathComponent(folderName, isDirectory: true)
+        do {
+            if !fm.fileExists(atPath: monthURL.path) {
+                try fm.createDirectory(at: monthURL, withIntermediateDirectories: true)
+            }
+            let baseName = url.deletingPathExtension().lastPathComponent
+            let destName = baseName.lowercased().hasPrefix("cibc") ? url.lastPathComponent : "cibc_\(baseName).csv"
+            let destURL = monthURL.appendingPathComponent(destName)
+            if fm.fileExists(atPath: destURL.path) { try fm.removeItem(at: destURL) }
+            try fm.copyItem(at: url, to: destURL)
+        } catch {
+            return (false, "Failed to copy: \(error.localizedDescription)")
+        }
+        loadMonthFolders(from: base)
+        if !monthFolders.contains(folderName) { monthFolders.append(folderName); monthFolders.sort() }
+        selectedFolder = folderName
+        statusMessage = "✓ Imported to \(folderName)."
+        return (true, "Imported to \(folderName).")
+    }
+
+    private func parseFirstDateFromCSV(at url: URL) -> Date? {
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let lines = content.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard lines.count >= 2 else { return nil }
+        let header = lines[0]
+        let firstData = lines[1]
+        let headerParts = header.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces).lowercased() }
+        let dateIdx = headerParts.firstIndex { $0.contains("date") } ?? 0
+        let dataParts = firstData.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        guard dateIdx < dataParts.count else { return nil }
+        let dateStr = dataParts[dateIdx].trimmingCharacters(in: .whitespaces)
+        let formatters: [DateFormatter] = [
+            { let f = DateFormatter(); f.dateFormat = "MM/dd/yyyy"; f.locale = Locale(identifier: "en_US_POSIX"); return f }(),
+            { let f = DateFormatter(); f.dateFormat = "dd/MM/yyyy"; f.locale = Locale(identifier: "en_US_POSIX"); return f }(),
+            { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX"); return f }(),
+            { let f = DateFormatter(); f.dateFormat = "M/d/yyyy"; f.locale = Locale(identifier: "en_US_POSIX"); return f }(),
+        ]
+        for formatter in formatters {
+            if let d = formatter.date(from: dateStr) { return d }
+        }
+        return nil
+    }
+
+    private func monthFolderName(from date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMMM yyyy"
+        formatter.locale = Locale(identifier: "en_US")
+        return formatter.string(from: date).uppercased()
+    }
+
+    /// Regenerate merge + report for every month folder. Runs on background; updates stepMessage and statusMessage on main.
+    func batchRegenerateAllReports() {
+        guard accountsDirURL != nil else {
+            statusMessage = "Accounts folder not found."
+            return
+        }
+        let folders = monthFolders
+        guard !folders.isEmpty else {
+            statusMessage = "No month folders to process."
+            return
+        }
+        isWorking = true
+        lastFailedAction = { [weak self] in self?.batchRegenerateAllReports() }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            var done = 0
+            var failed: String?
+            for (idx, folder) in folders.enumerated() {
+                DispatchQueue.main.async { self.stepMessage = "Processing \(folder) (\(idx + 1)/\(folders.count))…" }
+                let mergeResult = self.runScript(name: "merge_and_categorize.py", folder: folder)
+                if !mergeResult.success {
+                    failed = "\(folder): \(mergeResult.message)"
+                    break
+                }
+                let reportResult = self.runScript(name: "make_monthly_report.py", folder: folder, useMergedCategories: true)
+                if !reportResult.success {
+                    failed = "\(folder) report: \(reportResult.message)"
+                    break
+                }
+                done += 1
+            }
+            DispatchQueue.main.async {
+                self.isWorking = false
+                self.stepMessage = ""
+                self.lastFailedAction = failed == nil ? nil : { self.batchRegenerateAllReports() }
+                self.refreshFolders()
+                self.statusMessage = failed.map { "✗ \($0)" } ?? "✓ Regenerated \(done) report(s)."
+            }
+        }
+    }
+
+    /// Start or stop watching ~/Downloads for new cibc*.csv based on AppSettings.watchDownloadsFolder.
+    func updateDownloadsWatcher() {
+        if AppSettings.watchDownloadsFolder {
+            startDownloadsWatcher()
+        } else {
+            stopDownloadsWatcher()
+        }
+    }
+
+    private func startDownloadsWatcher() {
+        stopDownloadsWatcher()
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        guard let dir = downloads else { return }
+        downloadsWatcherTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.pollDownloadsForCSV(downloadsDir: dir)
+        }
+        RunLoop.main.add(downloadsWatcherTimer!, forMode: .common)
+        pollDownloadsForCSV(downloadsDir: dir)
+    }
+
+    private func stopDownloadsWatcher() {
+        downloadsWatcherTimer?.invalidate()
+        downloadsWatcherTimer = nil
+    }
+
+    private func pollDownloadsForCSV(downloadsDir: URL) {
+        let fm = FileManager.default
+        guard let contents = try? fm.contentsOfDirectory(at: downloadsDir, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else { return }
+        let cibcCSVs = contents.filter { $0.lastPathComponent.lowercased().hasPrefix("cibc") && $0.lastPathComponent.lowercased().hasSuffix(".csv") }
+        for url in cibcCSVs {
+            let path = url.path
+            if !downloadedCSVNotifiedPaths.contains(path) {
+                downloadedCSVNotifiedPaths.insert(path)
+                DispatchQueue.main.async { [weak self] in
+                    self?.detectedDownloadedCSV = url
+                }
+                return
+            }
+        }
+    }
+
+    /// Call after user moves or dismisses the detected CSV prompt; clears detectedDownloadedCSV.
+    func clearDetectedDownloadedCSV() {
+        detectedDownloadedCSV = nil
     }
 
     /// CSV count and report file date for the selected month (if any).
@@ -448,6 +812,11 @@ final class AccountsHelper: ObservableObject {
     /// Open the selected month's report .xlsx in the default app (Numbers, Excel, etc.). Tries Numbers if default fails.
     /// - Returns: true if opened successfully, false otherwise (e.g. no app to open .xlsx).
     @discardableResult
+    func openPDFReport() -> Bool {
+        guard let url = lastPDFPath, FileManager.default.fileExists(atPath: url.path) else { return false }
+        return NSWorkspace.shared.open(url)
+    }
+
     func openReportFile() -> Bool {
         let url = currentReportURL() ?? lastReportPath
         guard let reportURL = url, FileManager.default.fileExists(atPath: reportURL.path) else { return false }
@@ -704,9 +1073,25 @@ final class AccountsHelper: ObservableObject {
 
     // MARK: - Insights: merged CSV, audit, month summary, custom mapping
 
+    /// Report file modification date for a month folder, if the report exists.
+    func reportDate(monthFolder: String) -> Date? {
+        guard let url = currentReportURL(monthFolder: monthFolder) else { return nil }
+        return (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
+    }
+
+    private func currentReportURL(monthFolder: String) -> URL? {
+        guard let base = accountsDirURL, !monthFolder.isEmpty else { return nil }
+        let url = base.appendingPathComponent(monthFolder).appendingPathComponent("\(monthFolder)_Report.xlsx")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
     func mergedCSVURL() -> URL? {
-        guard let base = accountsDirURL, !selectedFolder.isEmpty else { return nil }
-        let url = base.appendingPathComponent(selectedFolder).appendingPathComponent("merged.csv")
+        mergedCSVURL(monthFolder: selectedFolder)
+    }
+
+    func mergedCSVURL(monthFolder: String) -> URL? {
+        guard let base = accountsDirURL, !monthFolder.isEmpty else { return nil }
+        let url = base.appendingPathComponent(monthFolder).appendingPathComponent("merged.csv")
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
@@ -727,6 +1112,73 @@ final class AccountsHelper: ObservableObject {
         return base.appendingPathComponent("custom_mapping.json")
     }
 
+    func transactionSplitsURL(monthFolder: String) -> URL? {
+        guard let base = accountsDirURL, !monthFolder.isEmpty else { return nil }
+        return base.appendingPathComponent(monthFolder).appendingPathComponent("transaction_splits.json")
+    }
+
+    func loadTransactionSplits(monthFolder: String) -> TransactionSplitsMap {
+        guard let url = transactionSplitsURL(monthFolder: monthFolder),
+              let data = try? Data(contentsOf: url),
+              let decoded = try? JSONDecoder().decode(TransactionSplitsMap.self, from: data) else { return [:] }
+        return decoded
+    }
+
+    func saveTransactionSplits(monthFolder: String, splits: TransactionSplitsMap) {
+        guard let url = transactionSplitsURL(monthFolder: monthFolder),
+              let data = try? JSONEncoder().encode(splits) else { return }
+        try? data.write(to: url)
+    }
+
+    /// Generate tax/export packet: selected categories, all months, output CSV or simple PDF path.
+    func generateTaxReport(categories: Set<String>, outputURL: URL, asCSV: Bool) -> (success: Bool, message: String) {
+        guard let base = accountsDirURL else { return (false, "Data folder not found.") }
+        var rows: [(month: String, category: String, amount: Double)] = []
+        for name in monthFolders {
+            guard let summary = loadMonthSummary(monthFolder: name) else { continue }
+            for (cat, amt) in summary.byCategory where categories.contains(cat) && amt > 0 {
+                rows.append((name, cat, amt))
+            }
+        }
+        if asCSV {
+            var csv = "Month,Category,Amount\n"
+            for r in rows { csv += "\(r.month),\(r.category),\(r.amount)\n" }
+            guard let data = csv.data(using: .utf8) else { return (false, "Encoding failed.") }
+            do {
+                try data.write(to: outputURL)
+                return (true, "Saved to \(outputURL.lastPathComponent)")
+            } catch {
+                return (false, error.localizedDescription)
+            }
+        }
+        return (false, "PDF export not implemented; use CSV.")
+    }
+
+    /// Schedule a repeating notification for the 1st of each month at 9:00 (remind to run report).
+    static func scheduleMonthlyReminder() {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            center.removePendingNotificationRequests(withIdentifiers: [monthlyReminderID])
+            let content = UNMutableNotificationContent()
+            content.title = "Monthly Reports"
+            content.body = "Reminder: run your monthly report for last month."
+            content.sound = .default
+            var date = DateComponents()
+            date.day = 1
+            date.hour = 9
+            date.minute = 0
+            let trigger = UNCalendarNotificationTrigger(dateMatching: date, repeats: true)
+            let request = UNNotificationRequest(identifier: monthlyReminderID, content: content, trigger: trigger)
+            center.add(request)
+        }
+    }
+
+    /// Remove the monthly reminder notification.
+    static func cancelMonthlyReminder() {
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [monthlyReminderID])
+    }
+
     func loadAuditInfo() -> AuditInfo? {
         guard let url = auditJSONURL(), let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(AuditInfo.self, from: data)
@@ -735,6 +1187,23 @@ final class AccountsHelper: ObservableObject {
     func loadMonthSummary(monthFolder: String) -> MonthSummary? {
         guard let url = monthSummaryURL(monthFolder: monthFolder), let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(MonthSummary.self, from: data)
+    }
+
+    /// Add unspent budget (limit - spent) per category to rollover for next month. Call after reviewing a month.
+    func applyRolloverFromMonth(monthFolder: String) -> (applied: Bool, message: String) {
+        guard AppSettings.enableBudgetRollover else { return (false, "Enable Budget Rollover in Settings first.") }
+        guard let summary = loadMonthSummary(monthFolder: monthFolder) else { return (false, "No summary for \(monthFolder).") }
+        var roll = AppSettings.rolloverBalances
+        var added = 0
+        for (category, spent) in summary.byCategory {
+            guard let limit = AppSettings.budgetLimits[category], limit > 0, spent < limit else { continue }
+            let unspent = limit - spent
+            roll[category, default: 0] += unspent
+            added += 1
+        }
+        if added == 0 { return (true, "No unspent budget to roll over for \(monthFolder).") }
+        AppSettings.rolloverBalances = roll
+        return (true, "Rolled over unspent from \(monthFolder) for \(added) categor\(added == 1 ? "y" : "ies").")
     }
 
     func loadDeltaInsight() -> DeltaInsight? {
@@ -772,8 +1241,146 @@ final class AccountsHelper: ObservableObject {
         )
     }
 
+    /// Last N months’ spending per category (for sparklines). Returns category -> [amount for oldest month ... newest].
+    func loadCategoryTrends(lastNMonths: Int = 6) -> [String: [Double]] {
+        let folders = Array(monthFolders.suffix(lastNMonths))
+        var out: [String: [Double]] = [:]
+        for (idx, name) in folders.enumerated() {
+            guard let s = loadMonthSummary(monthFolder: name) else { continue }
+            for (cat, amt) in s.byCategory where amt > 0 {
+                if out[cat] == nil { out[cat] = Array(repeating: 0, count: folders.count) }
+                out[cat]?[idx] = amt
+            }
+        }
+        return out
+    }
+
+    /// Spending by day in selected month (for calendar heatmap). Key = day of month (1-31).
+    func loadDailySpending(monthFolder: String) -> [Int: Double] {
+        let tx = loadMergedTransactions(monthFolder: monthFolder)
+        let formatters: [DateFormatter] = [
+            { let f = DateFormatter(); f.dateFormat = "MM/dd/yyyy"; return f }(),
+            { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f }(),
+            { let f = DateFormatter(); f.dateFormat = "dd/MM/yyyy"; return f }(),
+        ]
+        var byDay: [Int: Double] = [:]
+        for t in tx where t.amount < 0 {
+            var dayNum: Int?
+            for fmt in formatters {
+                if let d = fmt.date(from: t.date) {
+                    dayNum = Calendar.current.component(.day, from: d)
+                    break
+                }
+            }
+            if let d = dayNum, d >= 1, d <= 31 {
+                byDay[d, default: 0] += abs(t.amount)
+            }
+        }
+        return byDay
+    }
+
+    /// Recurring: same amount in 2+ months (subscription hunter). Returns (description_or_amount_key, amount, months).
+    func loadRecurringSubscriptions() -> [(key: String, amount: Double, months: [String])] {
+        var amountToDescs: [Double: [String: Set<String>]] = [:]
+        for name in monthFolders {
+            let tx = loadMergedTransactions(monthFolder: name)
+            for t in tx where t.amount < 0 {
+                let amt = abs(t.amount)
+                let desc = t.description.isEmpty ? "?" : String(t.description.prefix(40))
+                if amountToDescs[amt] == nil { amountToDescs[amt] = [:] }
+                if amountToDescs[amt]![desc] == nil { amountToDescs[amt]![desc] = Set() }
+                amountToDescs[amt]![desc]!.insert(name)
+            }
+        }
+        var result: [(key: String, amount: Double, months: [String])] = []
+        for (amt, descToMonths) in amountToDescs {
+            for (desc, months) in descToMonths where months.count >= 2 {
+                result.append((desc, amt, Array(months).sorted()))
+            }
+        }
+        result.sort { $0.amount > $1.amount }
+        return result
+    }
+
+    /// Estimated subscriptions due in the next 7 days (by typical day-of-month from history). Returns (total amount, list of (desc, amount)).
+    func subscriptionsDueInNext7Days() -> (total: Double, items: [(desc: String, amount: Double)]) {
+        let subs = loadRecurringSubscriptions()
+        let cal = Calendar.current
+        let today = Date()
+        let next7Days = (0..<7).compactMap { cal.date(byAdding: .day, value: $0, to: today) }
+        let daysSet = Set(next7Days.map { cal.component(.day, from: $0) })
+        var estimatedDayByKey: [String: Int] = [:]
+        for (key, amount, months) in subs {
+            guard let lastMonth = months.last else { continue }
+            let tx = loadMergedTransactions(monthFolder: lastMonth)
+            guard let t = tx.first(where: { abs($0.amount) == amount && (key == "?" || String($0.description.prefix(40)) == key) }) else {
+                estimatedDayByKey[key] = 15
+                continue
+            }
+            let day = t.date.split(separator: "-").last.flatMap { Int(String($0)) } ?? 15
+            estimatedDayByKey[key] = day
+        }
+        var items: [(desc: String, amount: Double)] = []
+        for (key, amount, _) in subs {
+            let day = estimatedDayByKey[key] ?? 15
+            if daysSet.contains(day) {
+                items.append((key, amount))
+            }
+        }
+        let total = items.reduce(0) { $0 + $1.amount }
+        return (total, items)
+    }
+
+    /// Merchant YoY: compare avg transaction amount for same merchant (description substring) across years.
+    func loadMerchantYoY() -> [(merchant: String, year1: Int, year2: Int, avg1: Double, avg2: Double)] {
+        var byMerchantYear: [String: [Int: [Double]]] = [:]
+        for name in monthFolders {
+            let parts = name.split(separator: " ")
+            guard parts.count >= 2, let y = Int(parts.last ?? "0") else { continue }
+            let tx = loadMergedTransactions(monthFolder: name)
+            for t in tx where t.amount < 0 {
+                let merchant = String(t.description.prefix(30)).trimmingCharacters(in: .whitespaces)
+                if merchant.isEmpty { continue }
+                if byMerchantYear[merchant] == nil { byMerchantYear[merchant] = [:] }
+                if byMerchantYear[merchant]![y] == nil { byMerchantYear[merchant]![y] = [] }
+                byMerchantYear[merchant]![y]!.append(abs(t.amount))
+            }
+        }
+        let calendarYear = Calendar.current.component(.year, from: Date())
+        let y1 = calendarYear - 2
+        let y2 = calendarYear - 1
+        var result: [(merchant: String, year1: Int, year2: Int, avg1: Double, avg2: Double)] = []
+        for (merchant, yearAmounts) in byMerchantYear {
+            guard let a1 = yearAmounts[y1], let a2 = yearAmounts[y2], !a1.isEmpty, !a2.isEmpty else { continue }
+            let avg1 = a1.reduce(0, +) / Double(a1.count)
+            let avg2 = a2.reduce(0, +) / Double(a2.count)
+            result.append((merchant, y1, y2, avg1, avg2))
+        }
+        result.sort { ($0.avg2 - $0.avg1) > ($1.avg2 - $1.avg1) }
+        return result
+    }
+
+    /// Projected end-of-month spend for current selected month (if we have partial data).
+    func projectedMonthSpend() -> (current: Double, projected: Double, dayOfMonth: Int, daysInMonth: Int)? {
+        guard !selectedFolder.isEmpty, let summary = loadMonthSummary(monthFolder: selectedFolder) else { return nil }
+        let now = Date()
+        let cal = Calendar.current
+        let day = cal.component(.day, from: now)
+        let range = cal.range(of: .day, in: .month, for: now)
+        let daysTotal = range?.count ?? 30
+        guard day > 0, daysTotal > 0 else { return nil }
+        let current = summary.totalSpent
+        let dailyAvg = day > 0 ? current / Double(day) : 0
+        let projected = dailyAvg * Double(daysTotal)
+        return (current, projected, day, daysTotal)
+    }
+
     func loadMergedTransactions() -> [MergedTransaction] {
-        guard let url = mergedCSVURL() else { return [] }
+        loadMergedTransactions(monthFolder: selectedFolder)
+    }
+
+    func loadMergedTransactions(monthFolder: String) -> [MergedTransaction] {
+        guard let url = mergedCSVURL(monthFolder: monthFolder) else { return [] }
         guard let content = try? String(contentsOf: url, encoding: .utf8) else { return [] }
         let lines = content.components(separatedBy: .newlines)
         guard lines.count >= 2 else { return [] }

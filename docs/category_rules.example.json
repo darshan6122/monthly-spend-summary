@@ -1,0 +1,14 @@
+{
+  "categories": [
+    "Work Income", "Transfers & Payments", "Shopping & Groceries", "Food & Drink",
+    "Restaurants", "Transport & Travel", "Subscriptions & Bills", "Utilities & Bills",
+    "Entertainment", "Fees & Interest", "Health", "Pharmacy", "Personal Care", "Gas & Auto",
+    "Uncategorized"
+  ],
+  "rules": [
+    { "pattern": "(?i)pay windreg|payroll", "category": "Work Income" },
+    { "pattern": "(?i)e-transfer|interac transfer", "category": "Transfers & Payments" },
+    { "pattern": "(?i)starbucks|tim hortons|mcdonald", "category": "Food & Drink" },
+    { "pattern": "(?i)amazon|amzn|costco", "category": "Shopping & Groceries" }
+  ]
+}

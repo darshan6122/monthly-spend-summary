@@ -1,0 +1,24 @@
+{
+  "default": "cibc",
+  "profiles": {
+    "cibc": {
+      "file_pattern": "cibc*.csv",
+      "columns": {
+        "date": 0,
+        "description": 1,
+        "debit": 2,
+        "credit": 3,
+        "account": 4
+      }
+    },
+    "rbc": {
+      "file_pattern": "rbc*.csv",
+      "columns": {
+        "date": 0,
+        "description": 1,
+        "debit": 2,
+        "credit": 3
+      }
+    }
+  }
+}
