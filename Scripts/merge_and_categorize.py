@@ -21,6 +21,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 _raw = os.environ.get("EXPENSE_REPORTS_ACCOUNTS_DIR")
 ACCOUNTS_DIR = Path(_raw).resolve() if _raw else Path(__file__).resolve().parent
@@ -54,7 +55,7 @@ _BUILTIN_ALL_CATEGORIES = [
 ]
 
 
-def _load_category_config(base_dir: Path | None = None) -> tuple[list[tuple[str, str]], list[str]]:
+def _load_category_config(base_dir: Optional[Path] = None) -> Tuple[List[Tuple[str, str]], List[str]]:
     """Load (rules, all_categories) from base_dir/category_rules.json if present; else use built-in."""
     base = base_dir or ACCOUNTS_DIR
     config_path = base / "category_rules.json"
@@ -76,11 +77,11 @@ def _load_category_config(base_dir: Path | None = None) -> tuple[list[tuple[str,
 
 
 # Resolved at runtime so category_rules.json can override.
-def _get_category_rules() -> list[tuple[str, str]]:
+def _get_category_rules() -> List[Tuple[str, str]]:
     return _load_category_config()[0]
 
 
-def _get_all_categories() -> list[str]:
+def _get_all_categories() -> List[str]:
     return _load_category_config()[1]
 
 # ML config (override via env ML_CONFIDENCE_THRESHOLD)
@@ -115,11 +116,11 @@ class TransactionClassifier:
     SOURCE_ML = "ml"
     SOURCE_UNCATEGORIZED = "uncategorized"
 
-    def __init__(self, accounts_dir: Path, current_month_folder: str | None = None):
+    def __init__(self, accounts_dir: Path, current_month_folder: Optional[str] = None):
         self.accounts_dir = Path(accounts_dir)
         self.current_month_folder = (current_month_folder or "").strip()
-        self.custom_mapping: dict[str, str] = {}
-        self._mapping_keys_sorted: list[str] = []  # longest first for substring match
+        self.custom_mapping: Dict[str, str] = {}
+        self._mapping_keys_sorted: List[str] = []  # longest first for substring match
         self._regex_rules, self._all_categories = _load_category_config(self.accounts_dir)
         self._vectorizer = None
         self._model = None
@@ -152,10 +153,10 @@ class TransactionClassifier:
             return TRANSFER_FALLBACK[1]
         return "Uncategorized"
 
-    def _load_historical_training_data(self) -> list[tuple[str, str]]:
+    def _load_historical_training_data(self) -> List[Tuple[str, str]]:
         """Load (description, category) from merged.csv in up to 3 other month folders."""
-        pairs: list[tuple[str, str]] = []
-        merged_files: list[tuple[datetime, Path]] = []
+        pairs: List[Tuple[str, str]] = []
+        merged_files: List[Tuple[datetime, Path]] = []
 
         for path in self.accounts_dir.iterdir():
             if not path.is_dir():
@@ -185,9 +186,9 @@ class TransactionClassifier:
                 continue
         return pairs
 
-    def _build_training_data(self) -> list[tuple[str, str]]:
+    def _build_training_data(self) -> List[Tuple[str, str]]:
         """Combine custom_mapping entries and historical merged.csv rows (non-Uncategorized)."""
-        pairs: list[tuple[str, str]] = []
+        pairs: List[Tuple[str, str]] = []
         for key, category in self.custom_mapping.items():
             if category and category != "Uncategorized":
                 pairs.append((key, category))
@@ -199,7 +200,7 @@ class TransactionClassifier:
                 seen.add(desc)
         return pairs
 
-    def _training_data_hash(self, training: list[tuple[str, str]]) -> str:
+    def _training_data_hash(self, training: List[Tuple[str, str]]) -> str:
         """Stable hash of training data for cache invalidation."""
         content = json.dumps(sorted(training), sort_keys=True)
         return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
@@ -258,7 +259,7 @@ class TransactionClassifier:
         except Exception as e:
             logger.warning("ML training skipped: %s", e)
 
-    def _predict_ml(self, description: str) -> tuple[str | None, float]:
+    def _predict_ml(self, description: str) -> Tuple[Optional[str], float]:
         """Return (category, confidence) or (None, 0.0) if not confident."""
         if not self._ml_trained or not self._vectorizer or not self._model:
             return None, 0.0
@@ -275,7 +276,7 @@ class TransactionClassifier:
             pass
         return None, 0.0
 
-    def categorize(self, description: str) -> tuple[str, str]:
+    def categorize(self, description: str) -> Tuple[str, str]:
         """
         Run the 3-step waterfall. Returns (category, source).
         source is one of: mapping, regex, ml, uncategorized.
@@ -324,7 +325,7 @@ def parse_amount(s: str) -> float:
         return 0.0
 
 
-def _load_bank_profile(base_dir: Path) -> tuple[str, int, int, int, int, int]:
+def _load_bank_profile(base_dir: Path) -> Tuple[str, int, int, int, int, int]:
     """Return (file_pattern, date_col, desc_col, debit_col, credit_col, account_col). Default CIBC."""
     path = base_dir / "profiles.json"
     if not path.exists():
@@ -348,7 +349,7 @@ def _load_bank_profile(base_dir: Path) -> tuple[str, int, int, int, int, int]:
         return ("cibc*.csv", 0, 1, 2, 3, 4)
 
 
-def read_bank_csv(filepath: Path, date_col: int, desc_col: int, debit_col: int, credit_col: int, account_col: int) -> list[dict]:
+def read_bank_csv(filepath: Path, date_col: int, desc_col: int, debit_col: int, credit_col: int, account_col: int) -> List[dict]:
     """Read one bank CSV with given column indices. Does not assign category."""
     rows = []
     source_name = filepath.stem
@@ -375,7 +376,7 @@ def read_bank_csv(filepath: Path, date_col: int, desc_col: int, debit_col: int, 
     return rows
 
 
-def read_cibc_csv(filepath: Path) -> list[dict]:
+def read_cibc_csv(filepath: Path) -> List[dict]:
     """Read one CIBC CSV (no header). Columns: Date, Description, Debit, Credit, Account."""
     return read_bank_csv(filepath, 0, 1, 2, 3, 4)
 
@@ -408,7 +409,7 @@ def main() -> None:
         sys.exit(1)
 
     # Global ignore list: descriptions matching any entry are excluded from merge (e.g. credit card payment duplicates)
-    ignore_list: list[str] = []
+    ignore_list: List[str] = []
     ignore_path = ACCOUNTS_DIR / "ignore_list.json"
     if ignore_path.exists():
         try:
@@ -433,7 +434,7 @@ def main() -> None:
 
     # Merge: same as before (dedupe across files, sort); skip rows matching ignore list
     all_rows = []
-    key_to_files: dict[tuple, set] = {}
+    key_to_files: Dict[tuple, set] = {}
     duplicate_count = 0
     total_credits = 0.0
     total_debits = 0.0
@@ -463,7 +464,7 @@ def main() -> None:
     all_rows.sort(key=lambda r: (r["Date"], r["Description"]))
 
     # Vendor normalization: replace description with clean name from vendor_aliases.json (longest match first)
-    vendor_aliases: dict[str, str] = {}
+    vendor_aliases: Dict[str, str] = {}
     alias_path = ACCOUNTS_DIR / "vendor_aliases.json"
     if alias_path.exists():
         try:

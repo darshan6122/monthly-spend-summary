@@ -11,13 +11,14 @@ DerivedData/
 *.perspectivev3
 !default.perspectivev3
 xcuserdata/
+**/xcuserdata/
+**/*.xcuserstate
 *.xccheckout
 *.moved-aside
 *.hmap
 *.ipa
 *.dSYM.zip
 *.dSYM
-*.xcuserstate
 *.xcworkspace/xcuserdata/
 
 # Swift Package Manager

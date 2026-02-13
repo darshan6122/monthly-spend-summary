@@ -14,7 +14,7 @@ enum KeychainHelper {
     /// Store a secret string for the given key (e.g. "apiKey"). Overwrites existing.
     static func set(_ value: String, forKey key: String) -> Bool {
         guard let data = value.data(using: .utf8) else { return false }
-        delete(key: key)
+        _ = delete(key: key)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

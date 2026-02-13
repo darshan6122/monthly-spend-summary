@@ -4,395 +4,504 @@
 //
 
 import SwiftUI
+import SwiftData
+import Combine
 import UniformTypeIdentifiers
 import AppKit
 
-/// State identifier for spring animations when switching Setup / Empty / Active.
-private enum ContentState: Equatable {
-    case setup
-    case empty
-    case active
+// MARK: - Navigation (Phase 3: Finance OS)
+enum FinanceNavigationItem: String, CaseIterable, Identifiable {
+    case dashboard = "Dashboard"
+    case transactions = "Transactions"
+    case rules = "Rules"
+    case budgets = "Budgets"
+    case subscriptions = "Subscriptions"
+    case netWorth = "Net Worth"
+    case categories = "Categories"
+    case settings = "Settings"
+    var id: String { rawValue }
 }
 
-// MARK: - Main Content View
-struct ContentView: View {
-    @EnvironmentObject var helper: AccountsHelper
-    @Binding var showSettings: Bool
-    @State private var showMore = false
-    @State private var showTechnicalSetup = false
-    @State private var showLastLog = false
-    @State private var showTraining = false
-    @State private var showDataHealth = false
-    @State private var showReportSummary = false
-    @State private var showCompareMonths = false
-    @State private var showRecurring = false
-    @State private var showYearInReview = false
-    @State private var showSplits = false
-    @State private var showTaxReport = false
-    @State private var showHeatmap = false
-    @State private var showInflation = false
-    @State private var showQuickLook = true
-    @AppStorage("ExpenseReports.hasSeenWelcome") private var hasSeenWelcome = false
-    @AppStorage("ExpenseReports.showTips") private var showTips = true
-    @State private var showWelcome = false
+/// Shared state so menu commands (⌘1–⌘6) and sidebar stay in sync.
+final class NavigationState: ObservableObject {
+    @Published var selection: FinanceNavigationItem? = .dashboard
+}
 
-    private var contentState: ContentState {
-        if !helper.setupInstructions.isEmpty { return .setup }
-        if helper.monthFolders.isEmpty { return .empty }
-        return .active
+// MARK: - Main Content View (Phase 3: Sidebar + Dashboard / Transactions / Rules)
+struct ContentView: View {
+    @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject var helper: AccountsHelper
+    @Binding var selection: FinanceNavigationItem?
+    let container: ModelContainer
+    @Query(sort: \Transaction.date) private var allTransactions: [Transaction]
+    @State private var isTargeted = false
+    @State private var lastImportMessage: String?
+    @State private var lastImportMessageVisible = false
+    @State private var showingWelcome = !UserDefaults.standard.bool(forKey: "hasLaunchedBefore")
+
+    var body: some View {
+        NavigationSplitView {
+            List(selection: $selection) {
+                Section("Overview") {
+                    NavigationLink(value: FinanceNavigationItem.dashboard) {
+                        Label("Dashboard", systemImage: "macwindow")
+                    }
+                    .keyboardShortcut(sidebarShortcut(for: .dashboard), modifiers: .command)
+                    NavigationLink(value: FinanceNavigationItem.transactions) {
+                        Label("History", systemImage: "list.bullet.rectangle")
+                    }
+                    .keyboardShortcut(sidebarShortcut(for: .transactions), modifiers: .command)
+                    NavigationLink(value: FinanceNavigationItem.netWorth) {
+                        Label("Wealth", systemImage: "banknote")
+                    }
+                    .keyboardShortcut(sidebarShortcut(for: .netWorth), modifiers: .command)
+                }
+                Section("Automation") {
+                    NavigationLink(value: FinanceNavigationItem.rules) {
+                        Label("Rules", systemImage: "bolt.fill")
+                    }
+                    .keyboardShortcut(sidebarShortcut(for: .rules), modifiers: .command)
+                    NavigationLink(value: FinanceNavigationItem.subscriptions) {
+                        Label("Recurring", systemImage: "calendar")
+                    }
+                    .keyboardShortcut(sidebarShortcut(for: .subscriptions), modifiers: .command)
+                }
+                Section("System") {
+                    NavigationLink(value: FinanceNavigationItem.budgets) {
+                        Label("Budgets", systemImage: "chart.bar")
+                    }
+                    .keyboardShortcut(sidebarShortcut(for: .budgets), modifiers: .command)
+                    NavigationLink(value: FinanceNavigationItem.categories) {
+                        Label("Categories", systemImage: "tag")
+                    }
+                    .keyboardShortcut(sidebarShortcut(for: .categories), modifiers: .command)
+                    NavigationLink(value: FinanceNavigationItem.settings) {
+                        Label("Backup & Data", systemImage: "gearshape")
+                    }
+                    .keyboardShortcut(sidebarShortcut(for: .settings), modifiers: .command)
+                }
+            }
+            .navigationTitle("Finance OS")
+        } detail: {
+            Group {
+                if selection == .dashboard && allTransactions.isEmpty {
+                    EmptyDashboardView()
+                } else {
+                    switch selection {
+                    case .dashboard:
+                        DashboardView()
+                    case .transactions:
+                    TransactionListView(lastImportMessage: $lastImportMessage, lastImportMessageVisible: $lastImportMessageVisible)
+                case .rules:
+                    RulesListView()
+                case .budgets:
+                    BudgetListView()
+                case .subscriptions:
+                    SubscriptionsView()
+                case .netWorth:
+                    NetWorthView()
+                case .categories:
+                    CategoriesListView()
+                case .settings:
+                    SettingsView()
+                case .none:
+                    Text("Select an item")
+                        .foregroundStyle(.secondary)
+                }
+                }
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button("Scan", systemImage: "arrow.clockwise") {
+                    runSubscriptionScan()
+                }
+                .keyboardShortcut("r", modifiers: .command)
+                .help("Re-scan transactions for recurring items (⌘R)")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button("Settings", systemImage: "gearshape") {
+                    selection = .settings
+                }
+            }
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            processDroppedFiles(urls: urls)
+            return true
+        } isTargeted: { isTargeted = $0 }
+        .overlay {
+            if isTargeted {
+                ZStack {
+                    Color.accentColor.opacity(0.3)
+                    VStack(spacing: 8) {
+                        Image(systemName: "doc.badge.arrow.down")
+                            .font(.system(size: 48))
+                        Text("Drop CSV to import")
+                            .font(.title2.weight(.medium))
+                    }
+                    .foregroundStyle(.white)
+                }
+                .allowsHitTesting(false)
+            }
+        }
+        .sheet(isPresented: $showingWelcome) {
+            OnboardingWelcomeView()
+        }
+        .sheet(isPresented: Binding(
+            get: { helper.requestShowReportSummary },
+            set: { helper.requestShowReportSummary = $0 }
+        )) {
+            ReportSummarySheet(helper: helper)
+        }
+        .onChange(of: helper.requestSubscriptionScan) { _, newValue in
+            if newValue {
+                runSubscriptionScan()
+                helper.requestSubscriptionScan = false
+            }
+        }
+        .onAppear {
+            CategoryManager.ensureDefaults(context: modelContext)
+        }
+    }
+
+    private func icon(for item: FinanceNavigationItem) -> String {
+        switch item {
+        case .dashboard: return "macwindow"
+        case .transactions: return "list.bullet.rectangle"
+        case .rules: return "bolt.fill"
+        case .budgets: return "chart.bar"
+        case .subscriptions: return "calendar"
+        case .netWorth: return "banknote"
+        case .categories: return "tag"
+        case .settings: return "gearshape"
+        }
+    }
+
+    private func sidebarShortcut(for item: FinanceNavigationItem) -> KeyEquivalent {
+        switch item {
+        case .dashboard: return "1"
+        case .transactions: return "2"
+        case .rules: return "3"
+        case .budgets: return "4"
+        case .subscriptions: return "5"
+        case .netWorth: return "6"
+        case .categories: return "7"
+        case .settings: return "8"
+        }
+    }
+
+    private func runSubscriptionScan() {
+        let descriptor = FetchDescriptor<Transaction>(sortBy: [SortDescriptor(\.date)])
+        let allTx = (try? modelContext.fetch(descriptor)) ?? []
+        SubscriptionScanner.scan(transactions: allTx, context: modelContext)
+        try? modelContext.save()
+    }
+
+    private func processDroppedFiles(urls: [URL]) {
+        let csvURLs = urls.filter { $0.isFileURL && $0.pathExtension.lowercased() == "csv" }
+        guard !csvURLs.isEmpty else { return }
+        let containerForBackground = container
+        Task.detached(priority: .userInitiated) {
+            let context = ModelContext(containerForBackground)
+            let descriptor = FetchDescriptor<Transaction>(sortBy: [SortDescriptor(\.date)])
+            let existing = (try? context.fetch(descriptor)) ?? []
+            var existingSignatures = Set(existing.map { tx in
+                let desc = tx.cleanDescription.isEmpty ? tx.originalDescription : tx.cleanDescription
+                return "\(tx.date.formatted(date: .numeric, time: .omitted))|\(desc)|\(tx.amount)"
+            })
+            var totalImported = 0
+            var importError: String?
+            let categorizer = Categorizer(context: context)
+            for url in csvURLs {
+                do {
+                    let newTransactions = try CSVImporter.parse(url: url)
+                    for tx in newTransactions {
+                        let desc = tx.cleanDescription.isEmpty ? tx.originalDescription : tx.cleanDescription
+                        let sig = "\(tx.date.formatted(date: .numeric, time: .omitted))|\(desc)|\(tx.amount)"
+                        guard !existingSignatures.contains(sig) else { continue }
+                        categorizer.categorize(tx)
+                        context.insert(tx)
+                        existingSignatures.insert(sig)
+                        totalImported += 1
+                    }
+                } catch {
+                    importError = "Failed to import \(url.lastPathComponent): \(error.localizedDescription)"
+                    break
+                }
+            }
+            try? context.save()
+            if totalImported > 0 {
+                let allTx = (try? context.fetch(descriptor)) ?? []
+                SubscriptionScanner.scan(transactions: allTx, context: context)
+                try? context.save()
+            }
+            await MainActor.run {
+                if let err = importError {
+                    lastImportMessage = err
+                    lastImportMessageVisible = true
+                } else if totalImported > 0 {
+                    lastImportMessage = "Imported \(totalImported) new transaction\(totalImported == 1 ? "" : "s")."
+                    lastImportMessageVisible = true
+                }
+                print("✅ Background Import Complete")
+            }
+        }
+    }
+}
+
+// MARK: - Empty dashboard state (Phase 8) when no transactions yet
+struct EmptyDashboardView: View {
+    var body: some View {
+        VStack(spacing: 30) {
+            Image(systemName: "banknote.fill")
+                .font(.system(size: 80))
+                .foregroundStyle(.blue.gradient)
+                .shadow(radius: 10)
+
+            VStack(spacing: 10) {
+                Text("Welcome to Finance OS")
+                    .font(.largeTitle)
+                    .bold()
+
+                Text("Your personal, private financial dashboard.")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 15) {
+                HStack {
+                    Image(systemName: "doc.on.doc")
+                    Text("Drag & drop CIBC CSV files anywhere to import.")
+                }
+                HStack {
+                    Image(systemName: "wand.and.stars")
+                    Text("Auto-categorization learns from your history.")
+                }
+                HStack {
+                    Image(systemName: "lock.fill")
+                    Text("Data is stored locally on your Mac.")
+                }
+            }
+            .padding()
+            .background(.gray.opacity(0.1))
+            .cornerRadius(10)
+
+            Text("Drop a file to get started")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+// MARK: - Categories (System): manage CategoryItem list
+struct CategoriesListView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Query(sort: \CategoryItem.name) private var categories: [CategoryItem]
+    @State private var showingAddSheet = false
+    @State private var newCategoryName = ""
+
+    var body: some View {
+        List {
+            ForEach(categories) { item in
+                HStack {
+                    Text(item.name)
+                        .font(.body)
+                    if item.isSystemDefault {
+                        Text("Default")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.secondary.opacity(0.15))
+                            .cornerRadius(4)
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 4)
+                .swipeActions(edge: .trailing) {
+                    if !item.isSystemDefault {
+                        Button(role: .destructive) {
+                            modelContext.delete(item)
+                            try? modelContext.save()
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Categories")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(action: { showingAddSheet = true }) {
+                    Label("Add Category", systemImage: "plus")
+                }
+                .keyboardShortcut("n", modifiers: .command)
+            }
+        }
+        .alert("New Category", isPresented: $showingAddSheet) {
+            TextField("Category Name", text: $newCategoryName)
+            Button("Cancel", role: .cancel) { newCategoryName = "" }
+            Button("Add") {
+                addCategory()
+            }
+        } message: {
+            Text("Enter the name for your new category.")
+        }
+    }
+
+    private func addCategory() {
+        let name = newCategoryName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        if categories.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
+            newCategoryName = ""
+            return
+        }
+        modelContext.insert(CategoryItem(name: name, isSystemDefault: false))
+        try? modelContext.save()
+        newCategoryName = ""
+    }
+}
+
+// MARK: - Transaction List (Transactions tab) — Phase 4: Search + context menus
+struct TransactionListView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Query(sort: \Transaction.date, order: .reverse) private var transactions: [Transaction]
+    @Query(sort: \CategoryItem.name) private var categories: [CategoryItem]
+    @Binding var lastImportMessage: String?
+    @Binding var lastImportMessageVisible: Bool
+    @State private var searchText = ""
+    @State private var showingAddSheet = false
+    @State private var transactionToEdit: Transaction?
+
+    private var filteredTransactions: [Transaction] {
+        if searchText.trimmingCharacters(in: .whitespaces).isEmpty { return transactions }
+        let q = searchText.lowercased()
+        return transactions.filter {
+            $0.cleanDescription.lowercased().contains(q) ||
+            $0.originalDescription.lowercased().contains(q) ||
+            $0.category.lowercased().contains(q) ||
+            "\($0.amount)".contains(q)
+        }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            headerView
-            mainContent
-                .animation(.spring(), value: contentState)
-            Spacer(minLength: 24)
-            moreSection
-            footerView
-        }
-        .padding(32)
-        .frame(minWidth: 500, minHeight: 600)
-        .sheet(isPresented: $showLastLog) {
-            LogSheet(logText: helper.lastScriptOutput, scriptFailed: helper.lastScriptFailed)
-        }
-        .sheet(isPresented: $showWelcome) {
-            WelcomeSheet(dismiss: { showWelcome = false; hasSeenWelcome = true })
-        }
-        .sheet(isPresented: $showSettings) {
-            SettingsSheet(showTips: $showTips)
-                .environmentObject(helper)
-        }
-        .sheet(isPresented: $showTraining) {
-            TrainingSheet(helper: helper)
-        }
-        .sheet(isPresented: $showDataHealth) {
-            DataHealthSheet(helper: helper)
-        }
-        .sheet(isPresented: $showReportSummary) {
-            ReportSummarySheet(helper: helper)
-        }
-        .sheet(isPresented: $showCompareMonths) {
-            CompareMonthsSheet(helper: helper)
-        }
-        .sheet(isPresented: $showRecurring) {
-            RecurringTransactionsSheet(helper: helper)
-        }
-        .sheet(isPresented: $showYearInReview) {
-            YearInReviewSheet(helper: helper)
-        }
-        .sheet(isPresented: $showSplits) {
-            SplitsSheet(helper: helper)
-        }
-        .sheet(isPresented: $showTaxReport) {
-            TaxReportSheet(helper: helper)
-        }
-        .sheet(isPresented: $showHeatmap) {
-            CalendarHeatmapSheet(helper: helper)
-        }
-        .sheet(isPresented: $showInflation) {
-            InflationTrackerSheet(helper: helper)
-        }
-        .onChange(of: helper.requestShowReportSummary) { _, requested in
-            if requested {
-                showReportSummary = true
-                helper.requestShowReportSummary = false
+            if lastImportMessageVisible, let msg = lastImportMessage {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text(msg)
+                        .font(.subheadline)
+                    Spacer()
+                    Button("Dismiss") { lastImportMessageVisible = false }
+                        .buttonStyle(.borderless)
+                }
+                .padding()
+                .background(Color.primary.opacity(0.04))
             }
-        }
-        .onAppear {
-            helper.refreshFolders()
-            if !hasSeenWelcome { showWelcome = true }
-        }
-        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-            guard let provider = providers.first else { return false }
-            _ = provider.loadObject(ofClass: URL.self) { obj, _ in
-                guard let url = obj, url.isFileURL else { return }
-                DispatchQueue.main.async {
-                    let path = url.path
-                    var isDir: ObjCBool = false
-                    if FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue {
-                        _ = helper.trySelectDroppedFolder(url)
-                    } else if path.lowercased().hasSuffix(".csv") {
-                        let result = helper.importDroppedCSV(url)
-                        if !result.success { helper.statusMessage = "✗ \(result.message)" }
-                    } else if path.lowercased().hasSuffix(".pdf") {
-                        let result = helper.importDroppedPDF(url)
-                        if !result.success { helper.statusMessage = "✗ \(result.message)" }
+            if transactions.isEmpty {
+                ContentUnavailableView(
+                    "Drop a CSV to import",
+                    systemImage: "doc.badge.plus",
+                    description: Text("Drag a bank export (CSV) onto this window.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(filteredTransactions) { tx in
+                    HStack(alignment: .center, spacing: 12) {
+                        MerchantLogoView(transaction: tx)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(tx.cleanDescription.isEmpty ? tx.originalDescription : tx.cleanDescription)
+                                .font(.headline)
+                                .lineLimit(1)
+                            Text(tx.date, style: .date)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(tx.category)
+                            .font(.caption)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(color(for: tx.category).opacity(0.2))
+                            .cornerRadius(4)
+                        Text(tx.amount, format: .currency(code: "CAD"))
+                            .font(.subheadline.monospacedDigit())
+                            .foregroundStyle(tx.amount < 0 ? .red : .green)
+                            .frame(width: 84, alignment: .trailing)
+                    }
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                    .contextMenu {
+                        Menu {
+                            ForEach(categories) { item in
+                                Button(item.name) {
+                                    tx.category = item.name
+                                    try? modelContext.save()
+                                }
+                            }
+                        } label: {
+                            Label("Change category", systemImage: "tag")
+                        }
+                        Button {
+                            transactionToEdit = tx
+                        } label: {
+                            Label("Edit Transaction", systemImage: "pencil")
+                        }
+                        Button { createRule(from: tx) } label: {
+                            Label("Create rule for \"\(String(tx.originalDescription.prefix(30)))\(tx.originalDescription.count > 30 ? "…" : "")\"", systemImage: "wand.and.stars")
+                        }
+                        Divider()
+                        Button(role: .destructive) { modelContext.delete(tx) } label: { Label("Delete", systemImage: "trash") }
+                    }
+                    .onTapGesture(count: 2) {
+                        transactionToEdit = tx
                     }
                 }
+                .searchable(text: $searchText, prompt: "Search merchants or categories")
             }
-            return true
         }
-        .alert("New bank export detected", isPresented: Binding(
-            get: { helper.detectedDownloadedCSV != nil },
-            set: { if !$0 { helper.clearDetectedDownloadedCSV() } }
-        )) {
-            Button("Move to month folder") {
-                if let url = helper.detectedDownloadedCSV {
-                    _ = helper.importDroppedCSV(url)
+        .navigationTitle("Transactions")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(action: { showingAddSheet = true }) {
+                    Label("Add Transaction", systemImage: "plus")
                 }
-                helper.clearDetectedDownloadedCSV()
+                .keyboardShortcut("n", modifiers: .command)
             }
-            Button("Cancel", role: .cancel) { helper.clearDetectedDownloadedCSV() }
-        } message: {
-            Text("A CIBC CSV was found in Downloads. Move it to your data folder? (Month is detected from the file.)")
+        }
+        .sheet(isPresented: $showingAddSheet) {
+            ManualEntryView()
+        }
+        .sheet(item: $transactionToEdit) { tx in
+            EditTransactionView(transaction: tx)
         }
     }
 
-    // MARK: - Header (breadcrumb)
-    private var headerView: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Image(systemName: "chart.bar.doc.horizontal.fill")
-                    .font(.title2)
-                    .foregroundStyle(.secondary)
-                Text("Monthly Reports")
-                    .font(.title2.weight(.semibold))
-            }
-            HStack(spacing: 6) {
-                Image(systemName: "folder.fill")
-                    .font(.caption2)
-                Text("Accounts")
-                Text("›")
-                Text(helper.selectedFolder.isEmpty ? "Pick a month" : helper.selectedFolder)
-                    .fontWeight(helper.selectedFolder.isEmpty ? .regular : .medium)
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-        .padding(.bottom, 20)
-    }
-
-    @ViewBuilder
-    private var mainContent: some View {
-        if !helper.setupInstructions.isEmpty {
-            setupCard
-        } else if helper.monthFolders.isEmpty {
-            dropZone
-        } else {
-            activeStateContent
+    private func color(for category: String) -> Color {
+        switch category {
+        case "Shopping & Groceries": return .green
+        case "Food & Drink", "Restaurants": return .orange
+        case "Transport & Travel": return .blue
+        case "Subscriptions & Bills": return .purple
+        case "Entertainment": return .pink
+        case "Fees & Interest": return .gray
+        case "Uncategorized": return .secondary
+        default: return .accentColor
         }
     }
 
-    // MARK: - Setup State
-    private var setupCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Button("Copy from Desktop", systemImage: "folder.badge.plus") {
-                let r = helper.copySetupFromDesktop()
-                helper.statusMessage = r.success ? "✓ \(r.message)" : "✗ \(r.message)"
-            }
-            .buttonStyle(.borderedProminent)
-            DisclosureGroup("Terminal Instructions", isExpanded: $showTechnicalSetup) {
-                Text(helper.setupInstructions)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.primary.opacity(0.05))
-                    .cornerRadius(6)
-                    .padding(.top, 4)
-            }
-            .font(.caption)
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.secondary.opacity(0.06))
-        .cornerRadius(8)
-        .padding(.bottom, 16)
-    }
-
-    // MARK: - Empty / Drop State
-    private var dropZone: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Add a month folder: drop here or open data folder.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            HStack(spacing: 8) {
-                Button("Open Data Folder", systemImage: "folder") { helper.openAccountsFolderInFinder() }
-                    .buttonStyle(.bordered)
-                Button("Copy from Desktop") {
-                    let r = helper.copySetupFromDesktop()
-                    helper.statusMessage = r.success ? "✓ \(r.message)" : "✗ \(r.message)"
-                }
-                .buttonStyle(.bordered)
-                Button("Refresh", systemImage: "arrow.clockwise") { helper.refreshFolders() }
-                    .buttonStyle(.bordered)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(20)
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [6]))
-                .foregroundStyle(.secondary.opacity(0.4))
-        )
-        .cornerRadius(8)
-        .padding(.bottom, 16)
-    }
-
-    // MARK: - Active State: Month strip + traffic light + Quick Look + Action Hub + Report Card + Quick Stats
-    private var activeStateContent: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            monthStrip
-            trafficLightIndicator
-                .padding(.top, 12)
-            reportAvailableBar
-            if showQuickLook, helper.mergedCSVURL() != nil {
-                QuickLookChart(helper: helper, onViewSummary: { showReportSummary = true })
-                    .padding(.top, 12)
-            }
-            ActionHub(helper: helper, showLastLog: $showLastLog, showTraining: $showTraining, showDataHealth: $showDataHealth, onViewSummary: { showReportSummary = true })
-                .padding(.top, 16)
-            if helper.statusMessage.hasPrefix("✓") && !helper.selectedFolder.isEmpty {
-                ReportCard(helper: helper, onViewSummary: { showReportSummary = true })
-                    .padding(.top, 16)
-                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
-                if let insight = helper.loadDeltaInsight() {
-                    QuickStatsBar(insight: insight, helper: helper)
-                        .padding(.top, 12)
-                }
-            }
-        }
-        .animation(.spring(), value: helper.statusMessage.hasPrefix("✓"))
-        .animation(.spring(), value: helper.selectedFolder)
-    }
-
-    // MARK: - Month Strip (horizontal pills)
-    private var monthStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(helper.monthFolders, id: \.self) { name in
-                    MonthPill(
-                        title: name,
-                        isSelected: name == helper.selectedFolder,
-                        subtitle: helper.reportDate(monthFolder: name).map { shortDate($0) },
-                        action: { helper.selectedFolder = name }
-                    )
-                }
-            }
-            .padding(.vertical, 2)
-        }
-        .padding(.bottom, 4)
-    }
-
-    // MARK: - Traffic Light Status
-    private var trafficLightIndicator: some View {
-        Group {
-            if let stats = helper.selectedMonthStats() {
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(trafficLightColor(stats: stats))
-                        .frame(width: 10, height: 10)
-                    Text(trafficLightLabel(stats: stats))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
-    }
-
-    private func trafficLightColor(stats: (csvCount: Int, reportDate: Date?)) -> Color {
-        if stats.csvCount == 0 { return .red }
-        if stats.reportDate == nil { return .yellow }
-        return .green
-    }
-
-    private func trafficLightLabel(stats: (csvCount: Int, reportDate: Date?)) -> String {
-        if stats.csvCount == 0 { return "No CSVs found" }
-        if let date = stats.reportDate {
-            return "Report up to date (\(shortDate(date)))"
-        }
-        return "CSVs found, no report"
-    }
-
-    /// Bar shown when selected month has report data; offers View summary.
-    private var reportAvailableBar: some View {
-        Group {
-            if !helper.selectedFolder.isEmpty,
-               helper.loadMonthSummary(monthFolder: helper.selectedFolder) != nil || helper.mergedCSVURL() != nil {
-                HStack(spacing: 8) {
-                    Image(systemName: "doc.text.fill")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("Report available for this month.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Button("View summary") { showReportSummary = true }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                }
-                .padding(.top, 10)
-            }
-        }
-    }
-
-    // MARK: - More drawer & Footer
-    private var moreSection: some View {
-        DisclosureGroup("More", isExpanded: $showMore) {
-            VStack(alignment: .leading, spacing: 10) {
-                Button("Compare two months", systemImage: "rectangle.on.rectangle.angled") { showCompareMonths = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                Button("Recurring transactions", systemImage: "repeat") { showRecurring = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                Button("Year in review", systemImage: "calendar.badge.clock") { showYearInReview = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                Button("Split transactions", systemImage: "rectangle.split.2x2") { showSplits = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                Button("Tax report…", systemImage: "doc.text.magnifyingglass") { showTaxReport = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                Button("Calendar heatmap", systemImage: "calendar") { showHeatmap = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                Button("Inflation tracker", systemImage: "chart.line.uptrend.xyaxis") { showInflation = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                if let date = helper.lastRunDate {
-                    Text("Last run \(shortDate(date)) \(shortTime(date))")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                Button("Export backup…", systemImage: "square.and.arrow.down") {
-                    helper.exportBackupWithSavePanel()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                Text(helper.accountsFolderPath)
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            .padding(.top, 6)
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-    }
-
-    private var footerView: some View {
-        HStack {
-            Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0")")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            Spacer()
-            Button(action: { showSettings = true }) {
-                Image(systemName: "gearshape")
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.top, 16)
-    }
-
-    func shortTime(_ date: Date) -> String {
-        DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short)
-    }
-
-    func shortDate(_ date: Date) -> String {
-        DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .none)
+    private func createRule(from tx: Transaction) {
+        let keyword = tx.originalDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !keyword.isEmpty else { return }
+        let rule = CategoryRule(keyword: keyword, category: tx.category)
+        modelContext.insert(rule)
+        let categorizer = Categorizer(context: modelContext)
+        categorizer.reapplyRules(to: Array(transactions))
+        try? modelContext.save()
     }
 }
 
@@ -1475,7 +1584,6 @@ struct SplitsSheet: View {
             } else {
                 List(transactions.filter { $0.amount < 0 }, id: \.id) { t in
                     let key = "\(t.date)|\(t.description)|\(t.amount)"
-                    let isSelected = selectedKey == key
                     let parts = splits[key] ?? []
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -1500,7 +1608,7 @@ struct SplitsSheet: View {
                 }
                 .listStyle(.plain)
                 .frame(minHeight: 200)
-                if let key = selectedKey, let t = transactions.first(where: { "\($0.date)|\($0.description)|\($0.amount)" == key }) {
+                if let key = selectedKey, let _ = transactions.first(where: { "\($0.date)|\($0.description)|\($0.amount)" == key }) {
                     Divider()
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Add portion").font(.subheadline.weight(.medium))
@@ -1707,113 +1815,6 @@ struct WelcomeSheet: View {
     }
 }
 
-// MARK: - Settings sheet
-struct SettingsSheet: View {
-    @EnvironmentObject var helper: AccountsHelper
-    @Binding var showTips: Bool
-    @AppStorage("ExpenseReports.openFolderAfterReport") private var openFolderAfterReport = true
-    @AppStorage("ExpenseReports.remindEndOfMonth") private var remindEndOfMonth = false
-    @Environment(\.dismiss) private var dismiss
-    @State private var showBudgets = false
-    @State private var showBatchRegenerateAlert = false
-    @State private var mlThreshold = AppSettings.mlConfidenceThreshold
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Settings")
-                .font(.headline)
-            Toggle("Open folder after report", isOn: $openFolderAfterReport)
-            Toggle("Show tips", isOn: $showTips)
-            Toggle("Remind me at start of month to run report", isOn: $remindEndOfMonth)
-                .onChange(of: remindEndOfMonth) { _, newValue in
-                    if newValue {
-                        AccountsHelper.scheduleMonthlyReminder()
-                    } else {
-                        AccountsHelper.cancelMonthlyReminder()
-                    }
-                }
-            Toggle("Watch Downloads for new bank CSV", isOn: Binding(
-                get: { AppSettings.watchDownloadsFolder },
-                set: { AppSettings.watchDownloadsFolder = $0; helper.updateDownloadsWatcher() }
-            ))
-            .onAppear { helper.updateDownloadsWatcher() }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("ML confidence threshold")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                HStack {
-                    Text("Strict")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Slider(value: $mlThreshold, in: 0.3...0.95, step: 0.05)
-                        .onChange(of: mlThreshold) { _, v in AppSettings.mlConfidenceThreshold = v }
-                    Text("Loose")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                Text("Higher = fewer auto-categories (more accurate). Lower = more ML guesses.")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-
-            Button("Regenerate all reports", systemImage: "arrow.clockwise.circle") {
-                showBatchRegenerateAlert = true
-            }
-            .buttonStyle(.bordered)
-            .disabled(helper.isWorking || helper.monthFolders.isEmpty)
-            .help("Re-run merge + report for every month folder (e.g. after updating custom_mapping)")
-
-            Toggle("Enable budget rollover", isOn: Binding(
-                get: { AppSettings.enableBudgetRollover },
-                set: { AppSettings.enableBudgetRollover = $0 }
-            ))
-            .help("Unspent budget per category rolls over; use “Apply rollover” after reviewing a month.")
-
-            Button("Budget limits…", systemImage: "dollarsign.circle") { showBudgets = true }
-                .buttonStyle(.bordered)
-            Button("Apply rollover from selected month", systemImage: "arrow.right.circle") {
-                let result = helper.applyRolloverFromMonth(monthFolder: helper.selectedFolder)
-                helper.statusMessage = result.message
-            }
-            .buttonStyle(.bordered)
-            .disabled(!AppSettings.enableBudgetRollover || helper.selectedFolder.isEmpty)
-            .help("Add unspent budget from the selected month to rollover for future months.")
-
-            Button("Export for Debugging", systemImage: "lock.shield") {
-                let panel = NSSavePanel()
-                panel.allowedContentTypes = [.zip]
-                panel.nameFieldStringValue = "ExpenseReports_anonymized_\(ISO8601DateFormatter().string(from: Date()).prefix(10)).zip"
-                panel.message = "Exports a zip with descriptions replaced by Vendor 1, Vendor 2, … (amounts and categories unchanged)."
-                if panel.runModal() == .OK, let url = panel.url {
-                    let result = helper.exportAnonymizedForDebugging(destinationURL: url)
-                    helper.statusMessage = result.success ? "✓ \(result.message)" : "✗ \(result.message)"
-                }
-            }
-            .buttonStyle(.bordered)
-            .disabled(helper.monthFolders.isEmpty)
-            .help("Create an anonymized zip for sharing or debugging without exposing vendor names.")
-
-            Spacer()
-            Button("Done") { dismiss() }
-                .keyboardShortcut(.defaultAction)
-        }
-        .padding(24)
-        .frame(minWidth: 320)
-        .sheet(isPresented: $showBudgets) { BudgetsSheet() }
-        .onAppear { mlThreshold = AppSettings.mlConfidenceThreshold }
-        .alert("Regenerate all reports?", isPresented: $showBatchRegenerateAlert) {
-            Button("Regenerate all", role: .destructive) {
-                helper.batchRegenerateAllReports()
-                dismiss()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This will run Merge + Report for every month folder. It may take a while.")
-        }
-    }
-}
-
 // MARK: - Budget limits sheet (set monthly limit per category; over = alert in summary)
 struct BudgetsSheet: View {
     @Environment(\.dismiss) private var dismiss
@@ -1913,7 +1914,8 @@ struct LogSheet: View {
 
 // MARK: - Preview
 #Preview {
-    ContentView(showSettings: .constant(false))
+    let container = try! ModelContainer(for: Transaction.self, CategoryRule.self, Budget.self, RecurringItem.self, CategoryItem.self, Account.self)
+    return ContentView(selection: .constant(.dashboard), container: container)
         .environmentObject(AccountsHelper())
         .frame(width: 520, height: 640)
 }

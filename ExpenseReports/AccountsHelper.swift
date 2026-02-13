@@ -39,6 +39,8 @@ final class AccountsHelper: ObservableObject {
     @Published var lastPDFPath: URL?
     /// When set to true, the UI should present the in-app report summary sheet (no Excel needed).
     @Published var requestShowReportSummary: Bool = false
+    /// When set to true, the UI should run subscription scan (e.g. from View menu ⌘R).
+    @Published var requestSubscriptionScan: Bool = false
     /// When Downloads watcher finds a new cibc*.csv, set here; UI shows "Move to [Current Month]?" and clears on action.
     @Published var detectedDownloadedCSV: URL?
 
@@ -387,7 +389,8 @@ final class AccountsHelper: ObservableObject {
             let out = String(data: outData, encoding: .utf8) ?? ""
             let monthLine = out.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? ""
             if process.terminationStatus != 0 {
-                let err = (try? errPipe.fileHandleForReading.readDataToEndOfFile()).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let err = String(data: errData, encoding: .utf8) ?? ""
                 return (false, err.isEmpty ? "PDF extraction failed." : err, nil)
             }
             loadMonthFolders(from: base)
@@ -1132,7 +1135,7 @@ final class AccountsHelper: ObservableObject {
 
     /// Generate tax/export packet: selected categories, all months, output CSV or simple PDF path.
     func generateTaxReport(categories: Set<String>, outputURL: URL, asCSV: Bool) -> (success: Bool, message: String) {
-        guard let base = accountsDirURL else { return (false, "Data folder not found.") }
+        guard accountsDirURL != nil else { return (false, "Data folder not found.") }
         var rows: [(month: String, category: String, amount: Double)] = []
         for name in monthFolders {
             guard let summary = loadMonthSummary(monthFolder: name) else { continue }
